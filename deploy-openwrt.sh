@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${OPENWRT_CONFIG:-$SCRIPT_DIR/config.env}"
+if [[ -r "$CONFIG_FILE" ]]; then
+    # This is a trusted shell-style project configuration file. Environment
+    # variables can override its defaults because config.env uses ${VAR:-...}.
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+else
+    echo "deploy-openwrt: missing configuration file: $CONFIG_FILE" >&2
+    exit 1
+fi
+CACHE_DIR="$SCRIPT_DIR/cache"
+BUILD_DIR="$SCRIPT_DIR/build"
+BUNDLED_CROSVM="$SCRIPT_DIR/assets/crosvm/android13/crosvm"
+DEVICE_DIR=/data/local/openwrt
+STAGE_DIR=/data/local/tmp/openwrt-deploy
+if [[ -z "${ADB_BIN:-}" ]]; then
+    # Pick the executable independently of device count. `adb get-state`
+    # returns an error when several devices are present, which must not be
+    # mistaken for a missing adb installation.
+    for adb_candidate in adb.exe adb; do
+        command -v "$adb_candidate" >/dev/null 2>&1 || continue
+        ADB_BIN="$(command -v "$adb_candidate")"
+        break
+    done
+    : "${ADB_BIN:=adb}"
+fi
+OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.5}"
+OPENWRT_TARGET="${OPENWRT_TARGET:-armsr/armv8}"
+OPENWRT_PASSWORD="${OPENWRT_PASSWORD:-openwrt}"
+DISK_SIZE="${DISK_SIZE:-8G}"
+# The official ext4 image is about 104 MiB. Keep only a small safety margin
+# for first-boot package metadata; Android extends it sparsely to DISK_SIZE
+# after upload and OpenWrt grows ext4 online.
+TRANSFER_DISK_SIZE="${TRANSFER_DISK_SIZE:-128M}"
+VM_CPUS="${VM_CPUS:-6}"
+VM_MEMORY_MIB="${VM_MEMORY_MIB:-1024}"
+AUTO_TAKEOVER="${AUTO_TAKEOVER:-0}"
+IPV6_PASSTHROUGH="${IPV6_PASSTHROUGH:-1}"
+CROSVM_PATH="${CROSVM_PATH:-auto}"
+CELLULAR_IFACE="${CELLULAR_IFACE:-auto}"
+CELLULAR_ROUTE_TABLE="${CELLULAR_ROUTE_TABLE:-auto}"
+TETHER_IFACE_PATTERNS="${TETHER_IFACE_PATTERNS:-auto}"
+BASE_URL="https://downloads.openwrt.org/releases/$OPENWRT_VERSION/targets/$OPENWRT_TARGET"
+TARGET_BASENAME="${OPENWRT_TARGET//\//-}"
+KERNEL_NAME="openwrt-$OPENWRT_VERSION-$TARGET_BASENAME-generic-kernel.bin"
+ROOTFS_NAME="openwrt-$OPENWRT_VERSION-$TARGET_BASENAME-generic-ext4-rootfs.img.gz"
+WAN_HOST_IP=192.168.66.1
+WAN_GUEST_IP=192.168.66.2
+LAN_HOST_IP=192.168.88.2
+LAN_GUEST_IP=192.168.88.1
+WAN_DNS1="${WAN_DNS1:-223.5.5.5}"
+WAN_DNS2="${WAN_DNS2:-8.8.8.8}"
+
+say() { printf '\n==> %s\n' "$*"; }
+die() { echo "deploy-openwrt: $*" >&2; exit 1; }
+
+adb_cmd() {
+    if [[ -n "${ADB_SERIAL:-}" ]]; then
+        "$ADB_BIN" -s "$ADB_SERIAL" "$@"
+    else
+        "$ADB_BIN" "$@"
+    fi
+}
+
+# adb.exe (Windows) cannot read WSL paths; convert them when needed.
+adb_path() {
+    if [[ "$ADB_BIN" == *.exe ]] && command -v wslpath >/dev/null 2>&1; then
+        wslpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+device_manager() {
+    local args="${*:-status}"
+    adb_cmd shell "su 0 sh -c '$DEVICE_DIR/openwrt.sh $args'"
+}
+
+device_has_manager() {
+    adb_cmd shell "su 0 sh -c 'test -x $DEVICE_DIR/openwrt.sh'" >/dev/null 2>&1
+}
+
+device_has_image() {
+    adb_cmd shell "su 0 sh -c 'test -f $DEVICE_DIR/openwrt.img'" >/dev/null 2>&1
+}
+
+refuse_existing_image() {
+    if device_has_image; then
+        die "target already contains $DEVICE_DIR/openwrt.img; run 'backup' first and 'uninstall' only when you intend to replace it"
+    fi
+}
+
+select_device() {
+    [[ -n "${ADB_SERIAL:-}" ]] && return 0
+
+    local devices=() installed=() serial
+    mapfile -t devices < <("$ADB_BIN" devices | tr -d '\r' | \
+        awk 'NR > 1 && $2 == "device" { print $1 }')
+    case "${#devices[@]}" in
+        0) die "no online ADB device found" ;;
+        1) ADB_SERIAL="${devices[0]}"; return 0 ;;
+    esac
+
+    # Management commands can safely identify the unique device that already
+    # contains this project's manager. Fresh installs still require an
+    # explicit serial because choosing the target by guess would be unsafe.
+    for serial in "${devices[@]}"; do
+        if "$ADB_BIN" -s "$serial" shell \
+                "su 0 sh -c 'test -x $DEVICE_DIR/openwrt.sh'" >/dev/null 2>&1; then
+            installed+=("$serial")
+        fi
+    done
+    if ((${#installed[@]} == 1)); then
+        ADB_SERIAL="${installed[0]}"
+        echo "deploy-openwrt: auto-selected installed device $ADB_SERIAL" >&2
+        return 0
+    fi
+    die "multiple ADB devices are online (${devices[*]}); set ADB_SERIAL in config.env or the environment"
+}
+
+check_device() {
+    command -v "$ADB_BIN" >/dev/null 2>&1 || die "$ADB_BIN not found"
+    select_device
+    adb_cmd get-state >/dev/null || die "ADB device is not available"
+    adb_cmd shell "su 0 sh -c 'test \"\$(id -u)\" = 0'" >/dev/null 2>&1 || \
+        die "root shell is unavailable (KernelSU/Magisk permission required)"
+}
+
+validate_config() {
+    [[ "$AUTO_TAKEOVER" == 0 || "$AUTO_TAKEOVER" == 1 ]] || \
+        die "AUTO_TAKEOVER must be 0 or 1"
+    [[ "$IPV6_PASSTHROUGH" == 0 || "$IPV6_PASSTHROUGH" == 1 ]] || \
+        die "IPV6_PASSTHROUGH must be 0 or 1"
+    [[ "$VM_CPUS" =~ ^[1-9][0-9]*$ ]] || die "VM_CPUS must be a positive integer"
+    [[ "$VM_MEMORY_MIB" =~ ^[1-9][0-9]*$ ]] || die "VM_MEMORY_MIB must be a positive integer"
+    [[ "$CROSVM_PATH" == auto || "$CROSVM_PATH" == bundled || "$CROSVM_PATH" == /* ]] || \
+        die "CROSVM_PATH must be auto, bundled, or an absolute device path"
+    [[ "$CROSVM_PATH" =~ ^[A-Za-z0-9_./-]+$ ]] || die "invalid CROSVM_PATH"
+    [[ "$CELLULAR_IFACE" =~ ^(auto|[A-Za-z0-9_.-]+)$ ]] || die "invalid CELLULAR_IFACE"
+    [[ "$CELLULAR_ROUTE_TABLE" =~ ^(auto|[A-Za-z0-9_.-]+)$ ]] || die "invalid CELLULAR_ROUTE_TABLE"
+    [[ -n "$TETHER_IFACE_PATTERNS" && "$TETHER_IFACE_PATTERNS" =~ ^[A-Za-z0-9_.*?+-]+([[:space:]]+[A-Za-z0-9_.*?+-]+)*$ ]] || \
+        die "invalid TETHER_IFACE_PATTERNS"
+}
+
+install_dependencies() {
+    local missing=()
+    for cmd in curl gzip e2fsck resize2fs virt-copy-in virt-copy-out sha256sum openssl file aarch64-linux-gnu-gcc; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    ((${#missing[@]} == 0)) && return
+    say "Installing WSL dependencies: ${missing[*]}"
+    sudo apt-get update
+    sudo apt-get install -y curl gzip e2fsprogs libguestfs-tools openssl file gcc-aarch64-linux-gnu
+}
+
+build_tools() {
+    mkdir -p "$BUILD_DIR/tools"
+    say "Building Android ARM64 IPv6 RA helper"
+    aarch64-linux-gnu-gcc -O2 -static -s -Wall -Wextra \
+        -o "$BUILD_DIR/tools/ra6" "$SCRIPT_DIR/tools/ra6.c"
+    file "$BUILD_DIR/tools/ra6"
+    say "Building Android ARM64 KVM/vGIC preflight helper"
+    aarch64-linux-gnu-gcc -O2 -static -s -Wall -Wextra \
+        -o "$BUILD_DIR/tools/kvm-probe" "$SCRIPT_DIR/tools/kvm_probe.c"
+    file "$BUILD_DIR/tools/kvm-probe"
+    [[ -x "$BUNDLED_CROSVM" ]] || die "missing bundled crosvm: $BUNDLED_CROSVM"
+    file "$BUNDLED_CROSVM" | grep -q 'ARM aarch64.*statically linked' || \
+        die "bundled crosvm is not a static ARM64 executable"
+}
+
+write_vm_config() {
+    local output="$1"
+    cat > "$output" <<EOF
+ROOT_DEVICE='/dev/vda'
+VM_CPUS='$VM_CPUS'
+VM_MEMORY_MIB='$VM_MEMORY_MIB'
+DISK_SIZE='$DISK_SIZE'
+AUTO_TAKEOVER='$AUTO_TAKEOVER'
+IPV6_PASSTHROUGH='$IPV6_PASSTHROUGH'
+CROSVM_PATH='$CROSVM_PATH'
+CELLULAR_IFACE='$CELLULAR_IFACE'
+CELLULAR_ROUTE_TABLE='$CELLULAR_ROUTE_TABLE'
+TETHER_IFACE_PATTERNS='$TETHER_IFACE_PATTERNS'
+EOF
+}
+
+download_image() {
+    mkdir -p "$CACHE_DIR"
+    for f in "$KERNEL_NAME" "$ROOTFS_NAME" sha256sums; do
+        if [[ ! -s "$CACHE_DIR/$f" ]]; then
+            say "Downloading $f"
+            curl -fL --retry 3 -o "$CACHE_DIR/$f.part" "$BASE_URL/$f"
+            mv "$CACHE_DIR/$f.part" "$CACHE_DIR/$f"
+        fi
+    done
+    say "Verifying OpenWrt SHA-256 checksums"
+    (cd "$CACHE_DIR" && sha256sum -c --ignore-missing sha256sums 2>&1 | grep -Ei "OK|FAILED") || true
+    (cd "$CACHE_DIR" && sha256sum -c --ignore-missing sha256sums) >/dev/null || die "checksum mismatch"
+}
+
+prepare_image() {
+    validate_config
+    [[ "$DISK_SIZE" =~ ^[1-9][0-9]*[KMG]$ ]] || die "invalid DISK_SIZE: $DISK_SIZE"
+    [[ "$TRANSFER_DISK_SIZE" =~ ^[1-9][0-9]*[KMG]$ ]] || die "invalid TRANSFER_DISK_SIZE: $TRANSFER_DISK_SIZE"
+    [[ "$BUILD_DIR" == "$SCRIPT_DIR/build" ]] || die "unsafe BUILD_DIR: $BUILD_DIR"
+    rm -rf -- "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+    export LIBGUESTFS_BACKEND=direct
+
+    say "Unpacking rootfs"
+    gzip -dc "$CACHE_DIR/$ROOTFS_NAME" > "$BUILD_DIR/openwrt.img"
+
+    # Bake /etc/config/network. OpenWrt's /bin/config_generate only creates it
+    # when missing, so our static WAN/LAN setup survives first boot.
+    # eth0 = first crosvm tap (owrt-wan, WAN side), eth1 = second tap (owrt-lan).
+    cat > "$BUILD_DIR/network" <<EOF
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	option macaddr '02:00:00:00:88:01'
+	list ports 'eth1'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '$LAN_GUEST_IP'
+	option netmask '255.255.255.0'
+
+config interface 'wan'
+	option device 'eth0'
+	option proto 'static'
+	option ipaddr '$WAN_GUEST_IP'
+	option netmask '255.255.255.0'
+	option gateway '$WAN_HOST_IP'
+	list dns '$WAN_DNS1'
+	list dns '$WAN_DNS2'
+EOF
+    say "Baking network config into rootfs"
+    virt-copy-in -a "$BUILD_DIR/openwrt.img" "$BUILD_DIR/network" /etc/config/
+
+    # crosvm's ARM platform has no device-tree model. Publish the physical
+    # device/SoC name so ubus and LuCI do not show the model as "?".
+    say "Baking hardware model into rootfs"
+    virt-copy-in -a "$BUILD_DIR/openwrt.img" "$SCRIPT_DIR/device/rc.local" /etc/
+
+    say "Setting root password"
+    hash="$(openssl passwd -6 "$OPENWRT_PASSWORD")"
+    virt-copy-out -a "$BUILD_DIR/openwrt.img" /etc/shadow "$BUILD_DIR/"
+    sed -i "s|^root:[^:]*:|root:$hash:|" "$BUILD_DIR/shadow"
+    virt-copy-in -a "$BUILD_DIR/openwrt.img" "$BUILD_DIR/shadow" /etc/
+
+    say "Growing transfer image to $TRANSFER_DISK_SIZE"
+    # Run twice: the first pass fixes the factory image, the second clears the
+    # needs-fsck flag so resize2fs does not try to run e2fsck interactively.
+    # e2fsck returns 1 when it corrected errors, which is fine here.
+    for pass in 1 2; do
+        local rc=0
+        e2fsck -fy "$BUILD_DIR/openwrt.img" || rc=$?
+        ((rc <= 1)) || die "e2fsck failed with rc=$rc"
+    done
+    truncate -s "$TRANSFER_DISK_SIZE" "$BUILD_DIR/openwrt.img"
+    resize2fs "$BUILD_DIR/openwrt.img"
+
+    cp "$CACHE_DIR/$KERNEL_NAME" "$BUILD_DIR/Image"
+    file "$BUILD_DIR/Image"
+
+    # Sanity-check the baked files are readable and contain our settings.
+    rm -rf "$BUILD_DIR/check" "$BUILD_DIR/check2"
+    mkdir -p "$BUILD_DIR/check" "$BUILD_DIR/check2"
+    virt-copy-out -a "$BUILD_DIR/openwrt.img" /etc/config/network "$BUILD_DIR/check"
+    grep -q "$WAN_GUEST_IP" "$BUILD_DIR/check/network" || die "network config not baked"
+    virt-copy-out -a "$BUILD_DIR/openwrt.img" /etc/shadow "$BUILD_DIR/check2"
+    grep -q "^root:\\\$6\\\$" "$BUILD_DIR/check2/shadow" || die "root password not baked"
+    rm -rf "$BUILD_DIR/check3"
+    mkdir -p "$BUILD_DIR/check3"
+    virt-copy-out -a "$BUILD_DIR/openwrt.img" /etc/rc.local "$BUILD_DIR/check3"
+    grep -q "ZTE W210DS (Unisoc UMS9620S)" "$BUILD_DIR/check3/rc.local" || die "hardware model not baked"
+    grep -q "resize2fs /dev/vda" "$BUILD_DIR/check3/rc.local" || die "online rootfs growth not baked"
+
+    write_vm_config "$BUILD_DIR/vm.conf"
+    build_tools
+    say "Image prepared: $BUILD_DIR/openwrt.img ($(du -h "$BUILD_DIR/openwrt.img" | cut -f1) logical)"
+}
+
+deploy() {
+    check_device
+    # Refuse before doing downloads/build work, then check again immediately
+    # before the staged image is moved into place.  `install` must never be an
+    # implicit reinstall operation because the guest disk contains user data.
+    refuse_existing_image
+    install_dependencies
+    download_image
+    prepare_image
+
+    say "Uploading OpenWrt VM staging files"
+    adb_cmd shell "rm -rf $STAGE_DIR && mkdir -p $STAGE_DIR"
+    adb_cmd push "$(adb_path "$BUILD_DIR/openwrt.img")" "$STAGE_DIR/openwrt.img"
+    say "Sparsely extending image to $DISK_SIZE"
+    adb_cmd shell "su 0 sh -c 'command -v truncate >/dev/null && truncate -s $DISK_SIZE $STAGE_DIR/openwrt.img && logical=\$(stat -c %s $STAGE_DIR/openwrt.img) && blocks=\$(stat -c %b $STAGE_DIR/openwrt.img) && allocated=\$((blocks * 512)) && echo logical=\$logical allocated=\$allocated && test \$allocated -lt \$logical'" || \
+        die "Android storage does not support the required sparse image"
+    adb_cmd push "$(adb_path "$BUILD_DIR/Image")" "$STAGE_DIR/Image"
+    adb_cmd push "$(adb_path "$BUILD_DIR/vm.conf")" "$STAGE_DIR/vm.conf"
+    adb_cmd push "$(adb_path "$SCRIPT_DIR/device/openwrt.sh")" "$STAGE_DIR/openwrt.sh"
+    adb_cmd push "$(adb_path "$BUILD_DIR/tools/ra6")" "$STAGE_DIR/ra6"
+    adb_cmd push "$(adb_path "$BUILD_DIR/tools/kvm-probe")" "$STAGE_DIR/kvm-probe"
+    adb_cmd push "$(adb_path "$BUNDLED_CROSVM")" "$STAGE_DIR/crosvm"
+
+    refuse_existing_image
+    adb_cmd shell "su 0 sh -c 'mkdir -p $DEVICE_DIR && mv $STAGE_DIR/openwrt.img $DEVICE_DIR/openwrt.img && mv $STAGE_DIR/Image $DEVICE_DIR/Image && mv $STAGE_DIR/vm.conf $DEVICE_DIR/vm.conf && mv $STAGE_DIR/openwrt.sh $DEVICE_DIR/openwrt.sh && mv $STAGE_DIR/ra6 $DEVICE_DIR/ra6 && mv $STAGE_DIR/kvm-probe $DEVICE_DIR/kvm-probe && mv $STAGE_DIR/crosvm $DEVICE_DIR/crosvm && chmod 700 $DEVICE_DIR $DEVICE_DIR/openwrt.sh $DEVICE_DIR/ra6 $DEVICE_DIR/kvm-probe $DEVICE_DIR/crosvm && chmod 600 $DEVICE_DIR/openwrt.img $DEVICE_DIR/Image $DEVICE_DIR/vm.conf && chown -R root:root $DEVICE_DIR && rmdir $STAGE_DIR'"
+    device_manager preflight
+    device_manager start
+
+    cat <<EOF
+
+OpenWrt is booting. First boot takes 30-60s.
+SSH:      ssh root@192.168.88.1           (from a bridged USB/hotspot client)
+Web:      http://192.168.88.1             (LuCI from the OpenWrt LAN)
+Password: $OPENWRT_PASSWORD
+Topology: WAN 192.168.66.2 <-> host 192.168.66.1 (NAT out)
+          LAN 192.168.88.1 <-> owrt-br 192.168.88.2 (DHCP 100-249)
+          USB/WiFi hotspot ports join owrt-br while tethered
+Takeover: AUTO_TAKEOVER=$AUTO_TAKEOVER (configured in config.env)
+IPv6:     IPV6_PASSTHROUGH=$IPV6_PASSTHROUGH (0=OpenWrt managed, 1=Android passthrough)
+Status:   ./deploy-openwrt.sh status
+Logs:     ./deploy-openwrt.sh logs
+Remove:   ./deploy-openwrt.sh uninstall
+EOF
+}
+
+update_manager() {
+    local restart="${1:-1}"
+    install_dependencies
+    check_device
+    device_has_manager || die "OpenWrt is not installed; run install first"
+    build_tools
+    say "Uploading device manager only"
+    adb_cmd push "$(adb_path "$SCRIPT_DIR/device/openwrt.sh")" /data/local/tmp/openwrt.sh.new
+    adb_cmd push "$(adb_path "$BUILD_DIR/tools/ra6")" /data/local/tmp/ra6.new
+    adb_cmd push "$(adb_path "$BUILD_DIR/tools/kvm-probe")" /data/local/tmp/kvm-probe.new
+    adb_cmd push "$(adb_path "$BUNDLED_CROSVM")" /data/local/tmp/crosvm.new
+    adb_cmd shell "su 0 sh -c 'cp /data/local/tmp/openwrt.sh.new $DEVICE_DIR/openwrt.sh && cp /data/local/tmp/ra6.new $DEVICE_DIR/ra6.next && cp /data/local/tmp/kvm-probe.new $DEVICE_DIR/kvm-probe.next && cp /data/local/tmp/crosvm.new $DEVICE_DIR/crosvm.next && chown root:root $DEVICE_DIR/openwrt.sh $DEVICE_DIR/ra6.next $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/crosvm.next && chmod 700 $DEVICE_DIR/openwrt.sh $DEVICE_DIR/ra6.next $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/crosvm.next && mv -f $DEVICE_DIR/ra6.next $DEVICE_DIR/ra6 && mv -f $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/kvm-probe && mv -f $DEVICE_DIR/crosvm.next $DEVICE_DIR/crosvm && rm -f /data/local/tmp/openwrt.sh.new /data/local/tmp/ra6.new /data/local/tmp/kvm-probe.new /data/local/tmp/crosvm.new'"
+    sync_device_config
+    device_manager preflight
+    if [[ "$restart" == 1 ]]; then
+        device_manager restart
+        echo "Device manager updated and OpenWrt restarted"
+    else
+        device_manager refresh-ipv6
+        echo "Device manager updated; restart was not requested"
+    fi
+}
+
+sync_device_config() {
+    validate_config
+    check_device
+    device_has_manager || die "OpenWrt is not installed; run install first"
+    mkdir -p "$BUILD_DIR"
+    write_vm_config "$BUILD_DIR/vm.conf.sync"
+    adb_cmd push "$(adb_path "$BUILD_DIR/vm.conf.sync")" /data/local/tmp/openwrt-vm.conf.new
+    adb_cmd shell "su 0 sh -c 'chown root:root /data/local/tmp/openwrt-vm.conf.new && chmod 600 /data/local/tmp/openwrt-vm.conf.new && mv -f /data/local/tmp/openwrt-vm.conf.new $DEVICE_DIR/vm.conf'"
+}
+
+apply_config() {
+    sync_device_config
+    device_manager restart
+    echo "Configuration applied (AUTO_TAKEOVER=$AUTO_TAKEOVER)"
+}
+
+require_install() {
+    check_device
+    device_has_manager || die "OpenWrt is not installed; run install first"
+}
+
+backup_vm() {
+    (($# <= 1)) || die "usage: ./deploy-openwrt.sh backup [OUTPUT.img.gz]"
+    check_device
+    device_has_manager || die "OpenWrt is not installed; nothing to back up"
+    device_has_image || die "device manager exists but $DEVICE_DIR/openwrt.img is missing"
+
+    local serial_safe timestamp output output_dir output_name partial status
+    local was_running=0
+    serial_safe="${ADB_SERIAL//[^A-Za-z0-9_.-]/_}"
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    output="${1:-$SCRIPT_DIR/backups/openwrt-${serial_safe}-${timestamp}.img.gz}"
+    output_dir="$(dirname -- "$output")"
+    output_name="$(basename -- "$output")"
+    partial="$output.part"
+    mkdir -p -- "$output_dir"
+    [[ ! -e "$output" && ! -e "$partial" && ! -e "$output.sha256" && ! -e "$output.info" ]] || \
+        die "backup output already exists: $output"
+    command -v gzip >/dev/null 2>&1 || die "local gzip is required to verify the backup"
+    adb_cmd shell "su 0 sh -c 'command -v gzip >/dev/null'" >/dev/null 2>&1 || \
+        die "device gzip is unavailable"
+
+    status="$(device_manager status | tr -d '\r')"
+    case "$status" in
+        running*)
+            was_running=1
+            say "Stopping OpenWrt for a consistent disk backup"
+            device_manager stop
+            ;;
+        stopped) ;;
+        *) die "cannot determine VM state: $status" ;;
+    esac
+
+    # If transfer or verification fails, remove only the incomplete local file
+    # and restore the VM to its previous running state.
+    trap 'rm -f -- "${partial:-}"; if [[ "${was_running:-0}" == 1 ]]; then device_manager start >/dev/null 2>&1 || true; fi' EXIT
+
+    local image_stats
+    image_stats="$(adb_cmd shell "su 0 sh -c 'logical=\$(stat -c %s $DEVICE_DIR/openwrt.img) && blocks=\$(stat -c %b $DEVICE_DIR/openwrt.img) && echo logical_bytes=\$logical && echo allocated_bytes=\$((blocks * 512))'" | tr -d '\r')"
+    say "Backing up the VM disk to $output"
+    adb_cmd exec-out "su 0 sh -c 'exec gzip -1 -c $DEVICE_DIR/openwrt.img'" > "$partial"
+    [[ -s "$partial" ]] || die "device returned an empty backup"
+    gzip -t -- "$partial" || die "backup gzip verification failed"
+    mv -- "$partial" "$output"
+    (
+        cd -- "$output_dir"
+        sha256sum -- "$output_name" > "$output_name.sha256"
+    )
+    printf 'adb_serial=%s\ncreated_at=%s\n%s\n' \
+        "$ADB_SERIAL" "$(date --iso-8601=seconds)" "$image_stats" > "$output.info"
+
+    if [[ "$was_running" == 1 ]]; then
+        say "Restarting OpenWrt"
+        device_manager start
+        was_running=0
+    fi
+    trap - EXIT
+    echo "VM backup completed: $output ($(du -h "$output" | cut -f1))"
+    echo "SHA-256: $output.sha256"
+}
+
+show_help() {
+    cat <<EOF
+Usage: ./deploy-openwrt.sh COMMAND
+
+Deployment:
+  install          Build and install OpenWrt, then start it
+  backup [FILE]    Stop briefly and save the current VM disk as .img.gz
+  prepare          Download and prepare the local image only
+  update           Update device tools and restart OpenWrt
+  update-script    Update device tools without restarting OpenWrt
+  uninstall        Remove the device-side VM and project network rules
+  purge-local      Remove this project's local cache and build output
+
+Configuration:
+  show-config      Show the effective local configuration
+  apply-config     Upload config.env settings and restart OpenWrt
+  preflight        Check crosvm, KVM, TUN/TAP, bridge and interfaces
+  refresh-ipv6     Withdraw stale fallback RA and advertise current prefix
+
+Runtime:
+  start | stop | restart | status
+  logs [LINES]     Show host and guest logs (default: 200 lines)
+  ssh              Connect to OpenWrt at 192.168.88.1
+  takeover         Route Android application IPv4 through OpenWrt
+  untakeover       Keep Android/SIM/application traffic on Android
+
+Use ADB_SERIAL=SERIAL when the target cannot be selected automatically.
+EOF
+}
+
+case "${1:-help}" in
+    help|-h|--help) show_help ;;
+    install|deploy) deploy ;;
+    backup) shift; backup_vm "$@" ;;
+    prepare) install_dependencies; download_image; prepare_image ;;
+    update) update_manager 1 ;;
+    update-script) update_manager 0 ;;
+    apply-config) apply_config ;;
+    show-config)
+        validate_config
+        printf 'CONFIG_FILE=%s\nOPENWRT_VERSION=%s\nOPENWRT_TARGET=%s\nDISK_SIZE=%s\nTRANSFER_DISK_SIZE=%s\nVM_CPUS=%s\nVM_MEMORY_MIB=%s\nAUTO_TAKEOVER=%s\nIPV6_PASSTHROUGH=%s\nCROSVM_PATH=%s\nCELLULAR_IFACE=%s\nCELLULAR_ROUTE_TABLE=%s\nTETHER_IFACE_PATTERNS=%s\nWAN_DNS1=%s\nWAN_DNS2=%s\n' \
+            "$CONFIG_FILE" "$OPENWRT_VERSION" "$OPENWRT_TARGET" "$DISK_SIZE" \
+            "$TRANSFER_DISK_SIZE" "$VM_CPUS" "$VM_MEMORY_MIB" "$AUTO_TAKEOVER" "$IPV6_PASSTHROUGH" \
+            "$CROSVM_PATH" "$CELLULAR_IFACE" "$CELLULAR_ROUTE_TABLE" "$TETHER_IFACE_PATTERNS" \
+            "$WAN_DNS1" "$WAN_DNS2"
+        ;;
+    preflight) require_install; device_manager preflight ;;
+    refresh-ipv6) require_install; device_manager refresh-ipv6 ;;
+    start) require_install; device_manager start ;;
+    stop) require_install; device_manager stop ;;
+    restart) require_install; device_manager restart ;;
+    status) require_install; device_manager status ;;
+    logs)
+        [[ "${2:-200}" =~ ^[1-9][0-9]*$ ]] || die "log line count must be a positive integer"
+        require_install
+        device_manager logs "${2:-200}"
+        ;;
+    ssh) exec ssh root@192.168.88.1 ;;
+    takeover) require_install; device_manager takeover ;;
+    untakeover) require_install; device_manager untakeover ;;
+    uninstall)
+        check_device
+        if device_has_manager; then
+            device_manager uninstall
+        else
+            echo "Device-side OpenWrt VM is already absent"
+        fi
+        echo "Device-side OpenWrt VM was removed. Download cache remains in $CACHE_DIR"
+        ;;
+    purge-local)
+        [[ "$CACHE_DIR" == "$SCRIPT_DIR/cache" && "$BUILD_DIR" == "$SCRIPT_DIR/build" ]] || die "unsafe local paths"
+        rm -rf -- "$CACHE_DIR" "$BUILD_DIR"
+        echo "Local OpenWrt cache/build files removed"
+        ;;
+    *)
+        echo "deploy-openwrt: unknown command: $1" >&2
+        show_help >&2
+        exit 2
+        ;;
+esac

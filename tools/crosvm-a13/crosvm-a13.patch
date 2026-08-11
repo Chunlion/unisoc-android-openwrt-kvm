@@ -1,0 +1,80 @@
+diff --git a/base/src/unix/linux/syslog.rs b/base/src/unix/linux/syslog.rs
+index 05972a3..79ba3c0 100644
+--- a/base/src/unix/linux/syslog.rs
++++ b/base/src/unix/linux/syslog.rs
+@@ -35,7 +35,9 @@ pub struct PlatformSyslog {
+ impl Syslog for PlatformSyslog {
+     fn new() -> Result<Self, Error> {
+         Ok(Self {
+-            socket: Some(openlog_and_get_socket()?),
++            // AOSP devices without com.android.virt do not expose the Linux
++            // /dev/log socket. Keep stderr logging usable in that case.
++            socket: openlog_and_get_socket().ok(),
+         })
+     }
+ 
+diff --git a/disk/src/qcow/mod.rs b/disk/src/qcow/mod.rs
+index 27d60f4..4cef419 100644
+--- a/disk/src/qcow/mod.rs
++++ b/disk/src/qcow/mod.rs
+@@ -40,7 +40,7 @@ pub enum Error {
+     CompressedBlocksNotSupported,
+     #[error("failed to evict cache: {0}")]
+     EvictingCache(io::Error),
+-    #[error("file larger than max of {}: {0}", MAX_QCOW_FILE_SIZE)]
++    #[error("file larger than max of {max}: {0}", max = MAX_QCOW_FILE_SIZE)]
+     FileTooBig(u64),
+     #[error("failed to get file size: {0}")]
+     GettingFileSize(io::Error),
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index 19d3cef..69cb2bf 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -537,7 +537,7 @@ impl Vm for KvmVm {
+     }
+ 
+     fn create_device(&self, kind: DeviceKind) -> Result<SafeDescriptor> {
+-        let device = if let Some(dev) = self.get_device_params_arch(kind) {
++        let mut device = if let Some(dev) = self.get_device_params_arch(kind) {
+             dev
+         } else {
+             match kind {
+@@ -555,7 +555,7 @@ impl Vm for KvmVm {
+ 
+         // Safe because we know that our file is a VM fd, we know the kernel will only write correct
+         // amount of memory to our pointer, and we verify the return result.
+-        let ret = unsafe { base::ioctl_with_ref(self, KVM_CREATE_DEVICE(), &device) };
++        let ret = unsafe { base::ioctl_with_mut_ref(self, KVM_CREATE_DEVICE(), &mut device) };
+         if ret == 0 {
+             // Safe because we verify that ret is valid and we own the fd.
+             Ok(unsafe { SafeDescriptor::from_raw_descriptor(device.fd as i32) })
+diff --git a/src/main.rs b/src/main.rs
+index c910065..c780181 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3481,8 +3481,10 @@ fn print_usage() {
+ 
+ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
+     if let Err(e) = syslog::init() {
+-        println!("failed to initialize syslog: {}", e);
+-        return Err(());
++        // Android devices without the AVF APEX do not provide the Linux
++        // /dev/log socket expected by this portable static build. Logging to
++        // the VM console remains available, so do not make syslog fatal.
++        eprintln!("crosvm: syslog unavailable: {}", e);
+     }
+ 
+     panic_hook::set_panic_hook();
+diff --git a/third_party/vmm_vhost/Cargo.toml b/third_party/vmm_vhost/Cargo.toml
+index b7ba338..e040f26 100644
+--- a/third_party/vmm_vhost/Cargo.toml
++++ b/third_party/vmm_vhost/Cargo.toml
+@@ -19,7 +19,7 @@ vfio-device = []
+ [dependencies]
+ anyhow = "*"
+ base = { path = "../../base" }
+-bitflags = ">=1.0.1"
++bitflags = "1.3.2"
+ cfg-if = "1.0.0"
+ data_model = { path = "../../common/data_model" }
+ libc = ">=0.2.39"

@@ -1,0 +1,92 @@
+# Publish the physical device model for ubus/LuCI. crosvm's ARM virtual
+# platform does not expose a device-tree model, so OpenWrt otherwise reports
+# an empty model (shown as "?" in LuCI).
+mkdir -p /tmp/sysinfo
+printf '%s\n' 'ZTE W210DS (Unisoc UMS9620S)' > /tmp/sysinfo/model
+
+# Keep the LAN router link-local stable across crosvm restarts. Without a
+# fixed bridge MAC, clients retain obsolete RA default gateways after reboot.
+lan_device="$(uci show network | sed -n "s/^\(network\.[^=]*\)\.name='br-lan'$/\1/p" | head -n 1)"
+bridge_mac_changed=0
+if [ -n "$lan_device" ] && \
+		[ "$(uci -q get "$lan_device.macaddr")" != '02:00:00:00:88:01' ]; then
+	uci -q set "$lan_device.macaddr=02:00:00:00:88:01"
+	uci commit network
+	bridge_mac_changed=1
+fi
+
+# The Android manager passes this mode on the kernel command line. In managed
+# mode OpenWrt learns the carrier prefix on WAN, NAT66s its LAN ULA to that
+# public address, and owns LAN RA/DHCPv6. Passthrough mode keeps the historical
+# behavior where Android advertises the carrier /64 directly to clients.
+ipv6_passthrough=1
+case " $(cat /proc/cmdline) " in
+	*" owrt_ipv6_passthrough=0 "*) ipv6_passthrough=0 ;;
+esac
+current_mode="$(cat /etc/openwrt-vm-ipv6-mode 2>/dev/null)"
+if [ "$current_mode" != "$ipv6_passthrough" ]; then
+	wan_zone="$(uci show firewall | sed -n "s/^\(firewall\.[^=]*\)\.name='wan'$/\1/p" | head -n 1)"
+	if [ "$ipv6_passthrough" = 0 ]; then
+		uci -q set network.globals=globals
+		uci -q set network.globals.ula_prefix='fd00:beef:88::/48'
+		uci -q set network.lan.ip6assign='64'
+		uci -q set network.wan6=interface
+		uci -q set network.wan6.device='eth0'
+		uci -q set network.wan6.proto='dhcpv6'
+		uci -q set network.wan6.reqaddress='try'
+		uci -q set network.wan6.reqprefix='no'
+		# odhcp6c installs a source-specific default for the public WAN /64.
+		# LAN ULA packets need a route before NAT66 changes their source.
+		uci -q set network.owrt_v6_default=route6
+		uci -q set network.owrt_v6_default.interface='wan6'
+		uci -q set network.owrt_v6_default.target='::/0'
+		uci -q set network.owrt_v6_default.gateway='fe80::1'
+		uci -q set network.owrt_v6_default.metric='640'
+		uci -q set dhcp.lan.ra='server'
+		uci -q set dhcp.lan.dhcpv6='server'
+		uci -q set dhcp.lan.ndp='disabled'
+		uci -q set dhcp.lan.ra_default='1'
+		uci -q set dhcp.lan.ra_preference='high'
+		[ -n "$wan_zone" ] && uci -q set "$wan_zone.masq6=1"
+	else
+		# Let odhcpd invalidate the managed prefix/default route before it is
+		# disabled, so passthrough does not require a client reconnect.
+		/etc/init.d/odhcpd stop
+		uci -q delete network.lan.ip6assign
+		uci -q delete network.wan6
+		uci -q delete network.owrt_v6_default
+		uci -q set dhcp.lan.ra='disabled'
+		uci -q set dhcp.lan.dhcpv6='disabled'
+		uci -q set dhcp.lan.ndp='disabled'
+		uci -q delete dhcp.lan.ra_default
+		uci -q delete dhcp.lan.ra_preference
+		[ -n "$wan_zone" ] && uci -q delete "$wan_zone.masq6"
+	fi
+	uci commit network
+	uci commit dhcp
+	uci commit firewall
+	printf '%s\n' "$ipv6_passthrough" > /etc/openwrt-vm-ipv6-mode
+	/etc/init.d/network reload
+	/etc/init.d/firewall restart
+	/etc/init.d/odhcpd restart
+	# Remove the no-longer-advertised ULA from the router itself as well.
+	[ "$ipv6_passthrough" = 1 ] && \
+		ip -6 addr del fd00:beef:88::1/64 dev br-lan 2>/dev/null || true
+elif [ "$bridge_mac_changed" = 1 ]; then
+	/etc/init.d/network reload
+	/etc/init.d/odhcpd restart
+fi
+
+# The ADB payload contains a compact 1 GiB filesystem. Its backing file is
+# extended sparsely on Android; grow ext4 online to the virtual disk capacity.
+# OpenWrt 25.12 splits resize2fs from e2fsprogs, so install it on first boot.
+if [ -b /dev/vda ]; then
+	(
+		command -v resize2fs >/dev/null 2>&1 || {
+			apk update && apk add resize2fs
+		}
+		resize2fs /dev/vda
+	) >/tmp/resize-rootfs.log 2>&1
+fi
+
+exit 0
