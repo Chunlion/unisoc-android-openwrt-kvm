@@ -10,6 +10,8 @@ KERNEL="$VM_DIR/Image"
 CONFIG="$VM_DIR/vm.conf"
 PIDFILE="$VM_DIR/crosvm.pid"
 MONITOR_PIDFILE="$VM_DIR/network-monitor.pid"
+TETHER_STATE_FILE="$VM_DIR/tethering.state"
+LOCK_DIR="$VM_DIR/control.lock"
 RA6="$VM_DIR/ra6"
 KVM_PROBE="$VM_DIR/kvm-probe"
 IPV6_PREFIX_FILE="$VM_DIR/ipv6-prefix"
@@ -41,6 +43,9 @@ IPV6_FORWARD_CHAIN=OWT6_VM
 HOST_ROUTE_PRIO=1049
 SSH_DNAT_PORT=2223
 WEB_DNAT_PORT=8080
+UFI_TOOLS_PORT=2333
+START_TIMEOUT_SECONDS=30
+LOCK_HELD=0
 
 die() {
     echo "openwrt: $*" >&2
@@ -59,10 +64,40 @@ load_config() {
     : "${CELLULAR_IFACE:=auto}"
     : "${CELLULAR_ROUTE_TABLE:=auto}"
     : "${TETHER_IFACE_PATTERNS:=auto}"
+    : "${SSH_DNAT_PORT:=2223}"
+    : "${WEB_DNAT_PORT:=8080}"
+    : "${UFI_TOOLS_PORT:=2333}"
     case "$IPV6_PASSTHROUGH" in
         0|1) ;;
         *) die "IPV6_PASSTHROUGH must be 0 or 1" ;;
     esac
+}
+
+release_lock() {
+    [ "$LOCK_HELD" = 1 ] || return 0
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+}
+
+acquire_lock() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        if [ -n "$lock_pid" ] && [ -r "/proc/$lock_pid/cmdline" ] && \
+                tr '\000' ' ' < "/proc/$lock_pid/cmdline" | grep -Fq "$0"; then
+            die "another OpenWrt control command is running (PID $lock_pid)"
+        fi
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || \
+            die "cannot clear stale control lock: $LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null || die "cannot acquire control lock"
+    fi
+    echo "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=1
+    trap release_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }
 
 detect_cellular_iface() {
@@ -206,8 +241,15 @@ ensure_ip6_jump() {
     fi
 }
 
+refresh_tether_state() {
+    tether_state="$(dumpsys tethering 2>/dev/null)" || return 1
+    printf '%s\n' "$tether_state" | \
+        sed -n '/ - TetheredState[[:space:]]*$/p' > "$TETHER_STATE_FILE.next"
+    mv "$TETHER_STATE_FILE.next" "$TETHER_STATE_FILE"
+}
+
 is_tethered() {
-    dumpsys tethering 2>/dev/null | grep -q "^[[:space:]]*$1 - TetheredState"
+    grep -q "^[[:space:]]*$1 - TetheredState[[:space:]]*$" "$TETHER_STATE_FILE" 2>/dev/null
 }
 
 bridge_attach() {
@@ -267,7 +309,7 @@ bridge_detach() {
     rm -f "$VM_DIR/bridge-$iface.addr"
 }
 
-sync_bridge_ports() {
+sync_bridge_ports_cached() {
     for path in /sys/class/net/*; do
         iface="${path##*/}"
         if is_tether_candidate "$iface"; then
@@ -277,6 +319,11 @@ sync_bridge_ports() {
             bridge_detach "$iface"
         fi
     done
+}
+
+sync_bridge_ports() {
+    refresh_tether_state || return 0
+    sync_bridge_ports_cached
 }
 
 cellular_ipv6_prefix() {
@@ -515,7 +562,10 @@ sync_upstream() {
                 exit
             }
         }')"
-    [ -n "$upstream" ] || return 0
+    if [ -z "$upstream" ]; then
+        ip rule del priority "$UPSTREAM_RULE_PRIO" 2>/dev/null || true
+        return 0
+    fi
     current_upstream="$(ip -4 rule show priority "$UPSTREAM_RULE_PRIO" 2>/dev/null | awk '{print $NF; exit}')"
     [ "$current_upstream" = "$upstream" ] && return 0
     ip rule del priority "$UPSTREAM_RULE_PRIO" 2>/dev/null || true
@@ -614,16 +664,18 @@ setup_network() {
 
     iptables -t nat -N OWT_PRE 2>/dev/null || true
     iptables -t nat -F OWT_PRE
-    # External SSH (host 2223 -> OpenWrt LAN 88.1:22) and LuCI web
-    # (host 8080 -> 88.1:80). The LAN side is used so OpenWrt default
+    # Android LAN address SSH (host 2223 -> OpenWrt LAN 88.1:22) and LuCI
+    # (host 8080 -> 88.1:80). Restrict DNAT to 88.2 so cellular/Wi-Fi
+    # addresses do not expose the guest management ports. The LAN side is
+    # used so OpenWrt default
     # firewall (lan input ACCEPT) applies; OWT_POST rewrites the source to
     # 88.2 so replies come back through br-lan. legacy iptables rejects
     # multiple -i flags in one rule, so skip the taps with RETURN first.
     iptables -t nat -A OWT_PRE -p tcp -i "$WAN_TAP" -j RETURN
     iptables -t nat -A OWT_PRE -p tcp -i "$LAN_TAP" -j RETURN
-    iptables -t nat -A OWT_PRE -p tcp --dport "$SSH_DNAT_PORT" \
+    iptables -t nat -A OWT_PRE -p tcp -d "$LAN_HOST_IP" --dport "$SSH_DNAT_PORT" \
         -j DNAT --to-destination "$LAN_GUEST_IP:22"
-    iptables -t nat -A OWT_PRE -p tcp --dport "$WEB_DNAT_PORT" \
+    iptables -t nat -A OWT_PRE -p tcp -d "$LAN_HOST_IP" --dport "$WEB_DNAT_PORT" \
         -j DNAT --to-destination "$LAN_GUEST_IP:80"
     ensure_jump nat PREROUTING OWT_PRE
 
@@ -693,16 +745,33 @@ untakeover() {
     echo "OpenWrt takeover disabled"
 }
 
+network_state_snapshot() {
+    cat "$TETHER_STATE_FILE" 2>/dev/null
+    ip -4 route show table all 2>/dev/null | sed -n '/^default /p'
+    ip -6 -o addr show dev "$CELLULAR_IFACE" scope global 2>/dev/null
+    for path in /sys/class/net/*; do
+        iface="${path##*/}"
+        master="$(basename "$(readlink "$path/master" 2>/dev/null)" 2>/dev/null)"
+        printf '%s:%s\n' "$iface" "$master"
+    done
+}
+
 network_monitor() {
     load_config
     resolve_device_config
+    last_state=""
     while is_running; do
-        sync_bridge_ports
-        sync_ipv6_downstream
-        sync_dhcp_block
-        # Guest WAN forwarding must follow Wi-Fi/cellular changes regardless
-        # of whether Android's own locally generated traffic is taken over.
-        sync_upstream
+        refresh_tether_state || true
+        current_state="$(network_state_snapshot)"
+        if [ "$current_state" != "$last_state" ]; then
+            sync_bridge_ports_cached
+            sync_ipv6_downstream
+            sync_dhcp_block
+            # Guest WAN forwarding follows Wi-Fi/cellular route changes even
+            # when Android's own application traffic is not taken over.
+            sync_upstream
+            last_state="$current_state"
+        fi
         sleep 3
     done
 }
@@ -724,6 +793,41 @@ stop_monitor() {
     rm -f "$MONITOR_PIDFILE"
 }
 
+port_listening() {
+    port_hex="$(printf '%04X' "$1" 2>/dev/null)" || return 1
+    awk -v suffix=":$port_hex" '
+        $2 ~ suffix "$" && $4 == "0A" { found = 1 }
+        END { exit !found }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+wait_guest_ready() {
+    n=0
+    while [ "$n" -lt "$START_TIMEOUT_SECONDS" ]; do
+        ping -c 1 -W 1 "$LAN_GUEST_IP" >/dev/null 2>&1 && return 0
+        is_running || return 1
+        sleep 1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+rollback_failed_start() {
+    stop_monitor
+    if is_running; then
+        pid="$(cat "$PIDFILE")"
+        "$CROSVM" stop "$SOCKET" >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
+        n=0
+        while [ "$n" -lt 5 ] && [ -d "/proc/$pid" ]; do
+            sleep 1
+            n=$((n + 1))
+        done
+        [ ! -d "/proc/$pid" ] || kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE" "$SOCKET"
+    teardown_network
+}
+
 preflight_vm() {
     load_config
     resolve_device_config
@@ -731,8 +835,12 @@ preflight_vm() {
         die "only arm64-v8a Android hosts are supported"
     [ -c /dev/kvm ] || die "/dev/kvm is unavailable"
     [ -c /dev/net/tun ] || die "/dev/net/tun is unavailable"
-    for command in ip iptables ip6tables truncate stat dumpsys; do
+    for command in ip iptables ip6tables truncate stat dumpsys ping; do
         command -v "$command" >/dev/null 2>&1 || die "required Android command is missing: $command"
+    done
+    for port in "$SSH_DNAT_PORT" "$WEB_DNAT_PORT"; do
+        port_listening "$port" && \
+            die "Android host port $port is already in use; change the corresponding port in config.env"
     done
     if [ -x "$KVM_PROBE" ]; then
         "$KVM_PROBE" >/dev/null || die "KVM/vGIC capability probe failed"
@@ -774,7 +882,10 @@ start_vm() {
     rm -f "$PIDFILE" "$SOCKET"
     : > "$LOG"
     : > "$CONSOLE"
-    setup_network
+    if ! (set -e; setup_network); then
+        rollback_failed_start
+        die "failed to configure VM networking; Android networking was restored"
+    fi
 
     if [ "$CROSVM_STYLE" = block ]; then
         nohup "$CROSVM" run \
@@ -807,8 +918,14 @@ start_vm() {
     if ! is_running; then
         echo "crosvm exited during startup:" >&2
         tail -n 80 "$LOG" >&2
-        rm -f "$PIDFILE"
-        exit 1
+        rollback_failed_start
+        die "crosvm failed to start; Android networking was restored"
+    fi
+    if ! wait_guest_ready; then
+        echo "OpenWrt did not become reachable during startup:" >&2
+        tail -n 80 "$CONSOLE" >&2
+        rollback_failed_start
+        die "OpenWrt startup timed out; Android networking was restored"
     fi
     if [ "$AUTO_TAKEOVER" = 1 ]; then
         takeover
@@ -854,7 +971,9 @@ status_vm() {
     resolve_device_config
     if is_running; then
         bridge_ports="$(ls "/sys/class/net/$LAN_BRIDGE/brif" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
-        echo "running PID=$(cat "$PIDFILE") wan=$WAN_GUEST_IP lan=$LAN_GUEST_IP bridge=$LAN_BRIDGE ports=${bridge_ports:-none} ipv6_passthrough=$IPV6_PASSTHROUGH ssh=localhost:$SSH_DNAT_PORT"
+        ufi_state=stopped
+        port_listening "$UFI_TOOLS_PORT" && ufi_state=running
+        echo "running PID=$(cat "$PIDFILE") wan=$WAN_GUEST_IP lan=$LAN_GUEST_IP bridge=$LAN_BRIDGE ports=${bridge_ports:-none} ipv6_passthrough=$IPV6_PASSTHROUGH ssh=host:$SSH_DNAT_PORT ufi=$ufi_state:$UFI_TOOLS_PORT"
     else
         echo "stopped"
         return 1
@@ -871,15 +990,15 @@ uninstall_vm() {
 
 case "${1:-}" in
     __network_monitor) network_monitor ;;
-    start) start_vm ;;
-    stop) stop_vm ;;
-    restart) stop_vm; start_vm ;;
+    start) acquire_lock; start_vm ;;
+    stop) acquire_lock; stop_vm ;;
+    restart) acquire_lock; stop_vm; start_vm ;;
     status) status_vm ;;
-    preflight) preflight_vm ;;
-    refresh-ipv6) refresh_ipv6 ;;
+    preflight) acquire_lock; preflight_vm ;;
+    refresh-ipv6) acquire_lock; refresh_ipv6 ;;
     logs) tail -n "${2:-200}" "$LOG" 2>/dev/null; echo "--- guest console ---"; tail -n "${2:-200}" "$CONSOLE" 2>/dev/null ;;
-    takeover) takeover ;;
-    untakeover) untakeover ;;
-    uninstall) uninstall_vm ;;
+    takeover) acquire_lock; load_config; resolve_device_config; takeover ;;
+    untakeover) acquire_lock; load_config; resolve_device_config; untakeover ;;
+    uninstall) acquire_lock; uninstall_vm ;;
     *) echo "usage: $0 {start|stop|restart|status|preflight|refresh-ipv6|logs [lines]|takeover|untakeover|uninstall}" >&2; exit 2 ;;
 esac

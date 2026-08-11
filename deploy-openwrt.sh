@@ -16,6 +16,7 @@ CACHE_DIR="$SCRIPT_DIR/cache"
 BUILD_DIR="$SCRIPT_DIR/build"
 BUNDLED_CROSVM="$SCRIPT_DIR/assets/crosvm/android13/crosvm"
 DEVICE_DIR=/data/local/openwrt
+DEVICE_NEW_DIR=/data/local/openwrt.new
 STAGE_DIR=/data/local/tmp/openwrt-deploy
 if [[ -z "${ADB_BIN:-}" ]]; then
     # Pick the executable independently of device count. `adb get-state`
@@ -30,7 +31,8 @@ if [[ -z "${ADB_BIN:-}" ]]; then
 fi
 OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.5}"
 OPENWRT_TARGET="${OPENWRT_TARGET:-armsr/armv8}"
-OPENWRT_PASSWORD="${OPENWRT_PASSWORD:-openwrt}"
+OPENWRT_PASSWORD="${OPENWRT_PASSWORD:-}"
+GENERATED_OPENWRT_PASSWORD=0
 DEVICE_MODEL="${DEVICE_MODEL:-auto}"
 RESOLVED_DEVICE_MODEL=""
 DISK_SIZE="${DISK_SIZE:-8G}"
@@ -40,6 +42,9 @@ DISK_SIZE="${DISK_SIZE:-8G}"
 TRANSFER_DISK_SIZE="${TRANSFER_DISK_SIZE:-128M}"
 VM_CPUS="${VM_CPUS:-6}"
 VM_MEMORY_MIB="${VM_MEMORY_MIB:-1024}"
+SSH_DNAT_PORT="${SSH_DNAT_PORT:-2223}"
+WEB_DNAT_PORT="${WEB_DNAT_PORT:-8080}"
+UFI_TOOLS_PORT="${UFI_TOOLS_PORT:-2333}"
 AUTO_TAKEOVER="${AUTO_TAKEOVER:-0}"
 IPV6_PASSTHROUGH="${IPV6_PASSTHROUGH:-1}"
 CROSVM_PATH="${CROSVM_PATH:-auto}"
@@ -162,9 +167,22 @@ force_remove_device_vm() {
 }
 
 refuse_existing_image() {
-    if device_has_image; then
-        die "target already contains $DEVICE_DIR/openwrt.img; run 'backup' first and 'uninstall' only when you intend to replace it"
+    local rc
+    if adb_probe_cmd shell "su 0 sh -c 'test -e $DEVICE_DIR'" >/dev/null 2>&1; then
+        die "target already contains $DEVICE_DIR; run 'backup' first and 'uninstall' only when you intend to replace it"
+    else
+        rc=$?
     fi
+    case "$rc" in
+        1) ;;
+        130|143) exit "$rc" ;;
+        124) die "timed out while checking $DEVICE_DIR" ;;
+        *) die "cannot verify whether $DEVICE_DIR already exists" ;;
+    esac
+}
+
+cleanup_deploy_stage() {
+    adb_cmd shell "su 0 sh -c 'rm -rf -- $STAGE_DIR $DEVICE_NEW_DIR'" >/dev/null 2>&1 || true
 }
 
 select_device() {
@@ -211,6 +229,14 @@ check_device() {
         [[ "$rc" == 124 ]] && die "ADB root probe timed out"
         die "root shell is unavailable (KernelSU/Magisk permission required)"
     }
+}
+
+check_install_device() {
+    local abi
+    abi="$(read_device_property ro.product.cpu.abi)"
+    [[ "$abi" == arm64-v8a ]] || die "only arm64-v8a Android hosts are supported"
+    adb_probe_cmd shell "su 0 sh -c 'test -c /dev/kvm && test -c /dev/net/tun'" \
+        >/dev/null 2>&1 || die "target requires working /dev/kvm and /dev/net/tun"
 }
 
 read_device_property() {
@@ -264,6 +290,16 @@ validate_config() {
     [[ "$DEVICE_MODEL" == auto ]] || validate_device_model "$DEVICE_MODEL"
     [[ "$VM_CPUS" =~ ^[1-9][0-9]*$ ]] || die "VM_CPUS must be a positive integer"
     [[ "$VM_MEMORY_MIB" =~ ^[1-9][0-9]*$ ]] || die "VM_MEMORY_MIB must be a positive integer"
+    local port
+    for port in "$SSH_DNAT_PORT" "$WEB_DNAT_PORT" "$UFI_TOOLS_PORT"; do
+        if [[ ! "$port" =~ ^[1-9][0-9]*$ ]] || ((port > 65535)); then
+            die "management ports must be integers from 1 to 65535"
+        fi
+    done
+    [[ "$SSH_DNAT_PORT" != "$WEB_DNAT_PORT" && \
+       "$SSH_DNAT_PORT" != "$UFI_TOOLS_PORT" && \
+       "$WEB_DNAT_PORT" != "$UFI_TOOLS_PORT" ]] || \
+        die "SSH_DNAT_PORT, WEB_DNAT_PORT and UFI_TOOLS_PORT must be different"
     [[ "$CROSVM_PATH" == auto || "$CROSVM_PATH" == bundled || "$CROSVM_PATH" == /* ]] || \
         die "CROSVM_PATH must be auto, bundled, or an absolute device path"
     [[ "$CROSVM_PATH" =~ ^[A-Za-z0-9_./-]+$ ]] || die "invalid CROSVM_PATH"
@@ -271,6 +307,12 @@ validate_config() {
     [[ "$CELLULAR_ROUTE_TABLE" =~ ^(auto|[A-Za-z0-9_.-]+)$ ]] || die "invalid CELLULAR_ROUTE_TABLE"
     [[ -n "$TETHER_IFACE_PATTERNS" && "$TETHER_IFACE_PATTERNS" =~ ^[A-Za-z0-9_.*?+-]+([[:space:]]+[A-Za-z0-9_.*?+-]+)*$ ]] || \
         die "invalid TETHER_IFACE_PATTERNS"
+}
+
+resolve_openwrt_password() {
+    [[ -n "$OPENWRT_PASSWORD" ]] && return 0
+    OPENWRT_PASSWORD="$(openssl rand -hex 12)"
+    GENERATED_OPENWRT_PASSWORD=1
 }
 
 install_dependencies() {
@@ -312,6 +354,9 @@ CROSVM_PATH='$CROSVM_PATH'
 CELLULAR_IFACE='$CELLULAR_IFACE'
 CELLULAR_ROUTE_TABLE='$CELLULAR_ROUTE_TABLE'
 TETHER_IFACE_PATTERNS='$TETHER_IFACE_PATTERNS'
+SSH_DNAT_PORT='$SSH_DNAT_PORT'
+WEB_DNAT_PORT='$WEB_DNAT_PORT'
+UFI_TOOLS_PORT='$UFI_TOOLS_PORT'
 EOF
 }
 
@@ -339,6 +384,7 @@ download_image() {
 
 prepare_image() {
     validate_config
+    resolve_openwrt_password
     [[ "$DISK_SIZE" =~ ^[1-9][0-9]*[KMG]$ ]] || die "invalid DISK_SIZE: $DISK_SIZE"
     [[ "$TRANSFER_DISK_SIZE" =~ ^[1-9][0-9]*[KMG]$ ]] || die "invalid TRANSFER_DISK_SIZE: $TRANSFER_DISK_SIZE"
     [[ "$BUILD_DIR" == "$SCRIPT_DIR/build" ]] || die "unsafe BUILD_DIR: $BUILD_DIR"
@@ -438,14 +484,20 @@ EOF
 
 deploy() {
     check_device
+    check_install_device
     # Refuse before doing downloads/build work, then check again immediately
     # before the staged image is moved into place.  `install` must never be an
     # implicit reinstall operation because the guest disk contains user data.
     refuse_existing_image
+    trap cleanup_deploy_stage EXIT
     resolve_device_model
     install_dependencies
     download_image
     prepare_image
+    if [[ "$GENERATED_OPENWRT_PASSWORD" == 1 ]]; then
+        echo "Generated OpenWrt password: $OPENWRT_PASSWORD"
+        echo "Save it now; it is not written to config.env."
+    fi
 
     say "Uploading OpenWrt VM staging files"
     adb_cmd shell "rm -rf $STAGE_DIR && mkdir -p $STAGE_DIR"
@@ -479,7 +531,8 @@ deploy() {
     verify_device_sha256 "$BUNDLED_CROSVM" "$STAGE_DIR/crosvm"
 
     refuse_existing_image
-    adb_cmd shell "su 0 sh -c 'mkdir -p $DEVICE_DIR && mv $STAGE_DIR/openwrt.img $DEVICE_DIR/openwrt.img && mv $STAGE_DIR/Image $DEVICE_DIR/Image && mv $STAGE_DIR/vm.conf $DEVICE_DIR/vm.conf && mv $STAGE_DIR/openwrt.sh $DEVICE_DIR/openwrt.sh && mv $STAGE_DIR/ra6 $DEVICE_DIR/ra6 && mv $STAGE_DIR/kvm-probe $DEVICE_DIR/kvm-probe && mv $STAGE_DIR/crosvm $DEVICE_DIR/crosvm && chmod 700 $DEVICE_DIR $DEVICE_DIR/openwrt.sh $DEVICE_DIR/ra6 $DEVICE_DIR/kvm-probe $DEVICE_DIR/crosvm && chmod 600 $DEVICE_DIR/openwrt.img $DEVICE_DIR/Image $DEVICE_DIR/vm.conf && chown -R root:root $DEVICE_DIR && rmdir $STAGE_DIR && sync'"
+    adb_cmd shell "su 0 sh -c 'rm -rf $DEVICE_NEW_DIR && mkdir -p $DEVICE_NEW_DIR && mv $STAGE_DIR/openwrt.img $DEVICE_NEW_DIR/openwrt.img && mv $STAGE_DIR/Image $DEVICE_NEW_DIR/Image && mv $STAGE_DIR/vm.conf $DEVICE_NEW_DIR/vm.conf && mv $STAGE_DIR/openwrt.sh $DEVICE_NEW_DIR/openwrt.sh && mv $STAGE_DIR/ra6 $DEVICE_NEW_DIR/ra6 && mv $STAGE_DIR/kvm-probe $DEVICE_NEW_DIR/kvm-probe && mv $STAGE_DIR/crosvm $DEVICE_NEW_DIR/crosvm && chmod 700 $DEVICE_NEW_DIR $DEVICE_NEW_DIR/openwrt.sh $DEVICE_NEW_DIR/ra6 $DEVICE_NEW_DIR/kvm-probe $DEVICE_NEW_DIR/crosvm && chmod 600 $DEVICE_NEW_DIR/openwrt.img $DEVICE_NEW_DIR/Image $DEVICE_NEW_DIR/vm.conf && chown -R root:root $DEVICE_NEW_DIR && test ! -e $DEVICE_DIR && mv $DEVICE_NEW_DIR $DEVICE_DIR && rmdir $STAGE_DIR && sync'"
+    trap - EXIT
     verify_device_sha256 "$BUILD_DIR/Image" "$DEVICE_DIR/Image"
     verify_device_sha256 "$BUILD_DIR/vm.conf" "$DEVICE_DIR/vm.conf"
     verify_device_sha256 "$SCRIPT_DIR/device/openwrt.sh" "$DEVICE_DIR/openwrt.sh"
@@ -489,12 +542,15 @@ deploy() {
     device_manager preflight
     device_manager start
 
+    local password_status="configured by OPENWRT_PASSWORD"
+    [[ "$GENERATED_OPENWRT_PASSWORD" == 0 ]] || password_status="generated above"
     cat <<EOF
 
-OpenWrt is booting. First boot takes 30-60s.
+OpenWrt is ready.
 SSH:      ssh root@192.168.88.1           (from a bridged USB/hotspot client)
 Web:      http://192.168.88.1             (LuCI from the OpenWrt LAN)
-Password: $OPENWRT_PASSWORD
+Password: $password_status
+UFI-Tools: http://192.168.88.2:$UFI_TOOLS_PORT (when its Android service is running)
 Topology: WAN 192.168.66.2 <-> host 192.168.66.1 (NAT out)
           LAN 192.168.88.1 <-> owrt-br 192.168.88.2 (DHCP 100-249)
           USB/WiFi hotspot ports join owrt-br while tethered
@@ -649,16 +705,25 @@ case "${1:-help}" in
     help|-h|--help) show_help ;;
     install|deploy) deploy ;;
     backup) shift; backup_vm "$@" ;;
-    prepare) install_dependencies; download_image; prepare_image ;;
+    prepare)
+        install_dependencies
+        download_image
+        prepare_image
+        if [[ "$GENERATED_OPENWRT_PASSWORD" == 1 ]]; then
+            echo "Generated OpenWrt password: $OPENWRT_PASSWORD"
+            echo "Save it now; it is not written to config.env."
+        fi
+        ;;
     update) update_manager 1 ;;
     update-script) update_manager 0 ;;
     apply-config) apply_config ;;
     show-config)
         validate_config
-        printf 'CONFIG_FILE=%s\nOPENWRT_VERSION=%s\nOPENWRT_TARGET=%s\nDEVICE_MODEL=%s\nDISK_SIZE=%s\nTRANSFER_DISK_SIZE=%s\nVM_CPUS=%s\nVM_MEMORY_MIB=%s\nAUTO_TAKEOVER=%s\nIPV6_PASSTHROUGH=%s\nCROSVM_PATH=%s\nCELLULAR_IFACE=%s\nCELLULAR_ROUTE_TABLE=%s\nTETHER_IFACE_PATTERNS=%s\nWAN_DNS1=%s\nWAN_DNS2=%s\n' \
+        printf 'CONFIG_FILE=%s\nOPENWRT_VERSION=%s\nOPENWRT_TARGET=%s\nDEVICE_MODEL=%s\nDISK_SIZE=%s\nTRANSFER_DISK_SIZE=%s\nVM_CPUS=%s\nVM_MEMORY_MIB=%s\nAUTO_TAKEOVER=%s\nIPV6_PASSTHROUGH=%s\nCROSVM_PATH=%s\nCELLULAR_IFACE=%s\nCELLULAR_ROUTE_TABLE=%s\nTETHER_IFACE_PATTERNS=%s\nSSH_DNAT_PORT=%s\nWEB_DNAT_PORT=%s\nUFI_TOOLS_PORT=%s\nWAN_DNS1=%s\nWAN_DNS2=%s\n' \
             "$CONFIG_FILE" "$OPENWRT_VERSION" "$OPENWRT_TARGET" "$DEVICE_MODEL" "$DISK_SIZE" \
             "$TRANSFER_DISK_SIZE" "$VM_CPUS" "$VM_MEMORY_MIB" "$AUTO_TAKEOVER" "$IPV6_PASSTHROUGH" \
             "$CROSVM_PATH" "$CELLULAR_IFACE" "$CELLULAR_ROUTE_TABLE" "$TETHER_IFACE_PATTERNS" \
+            "$SSH_DNAT_PORT" "$WEB_DNAT_PORT" "$UFI_TOOLS_PORT" \
             "$WAN_DNS1" "$WAN_DNS2"
         ;;
     preflight) require_install; device_manager preflight ;;

@@ -1,8 +1,7 @@
-# OpenWrt VM for W210DS / Android 13 ARM64
+# OpenWrt VM for ZTE F50 / W210DS
 
 在已 Root、具备 KVM/TUN 的 ARM64 Android 设备上，通过 `crosvm` 运行 OpenWrt。
-主分支面向 W210DS，并使用其系统 crosvm；MU300/F50 的安全路由方案位于
-`mu300-routed` 分支。
+支持 ZTE F50/MU300 和 W210DS，优先使用系统 crosvm，不可用时回退到项目内置版本。
 本项目完全独立于 Debian VM，不会读写 Debian 的镜像、缓存或设备目录。
 
 ## 当前功能
@@ -15,6 +14,7 @@
 - USB 共享和 Wi-Fi 热点作为二层端口动态加入 `owrt-br`
 - 热点客户端直接从 OpenWrt DHCP 获取 `192.168.88.x`，保留真实 MAC
 - Wi-Fi STA 或蜂窝网络自动成为 OpenWrt WAN 上游
+- 与 F50 上的 UFI-Tools 高级后台共存，默认使用独立的 `2333` 端口
 - 自动探测系统 crosvm、蜂窝接口和 Android 当前共享接口；系统没有 crosvm 时
   回退到项目内置的 Android 13 兼容静态 ARM64 版本
 
@@ -23,12 +23,13 @@
 需要 Windows 有线 ADB、WSL，以及手机端 KernelSU/Magisk root 权限。
 
 ```bash
-cd /mnt/c/Users/kano/Desktop/212ds/openwrt-vm
+cd /mnt/c/path/to/unisoc-android-openwrt-kvm
 chmod +x deploy-openwrt.sh
 ./deploy-openwrt.sh install
 ```
 
-默认密码为 `openwrt`。首次安装时可以覆盖参数：
+`OPENWRT_PASSWORD` 留空时，安装器生成 24 位十六进制密码并在完成后显示一次。
+也可以在首次安装时指定密码和资源参数：
 
 ```bash
 OPENWRT_PASSWORD='新密码' VM_CPUS=6 VM_MEMORY_MIB=1024 DISK_SIZE=8G \
@@ -50,11 +51,16 @@ CROSVM_PATH=auto             # auto / bundled / 设备上的绝对路径
 CELLULAR_IFACE=auto          # 例如 sipa_eth0；auto 会按地址和常见命名探测
 CELLULAR_ROUTE_TABLE=auto    # auto 默认使用最终探测到的蜂窝接口名
 TETHER_IFACE_PATTERNS=auto   # 或 "sipa_usb* wlan* softap* eth* br*"
+
+SSH_DNAT_PORT=2223   # Android 管理地址转发到 OpenWrt SSH
+WEB_DNAT_PORT=8080   # Android 管理地址转发到 LuCI
+UFI_TOOLS_PORT=2333  # UFI-Tools 状态检测，不接管该端口
 ```
 
 同平台设备建议先保留全部 `auto`。如果厂商改了接口命名，只改这里，不需要改
 `device/openwrt.sh`。部署器会在启动前检查 ARM64 ABI、KVM/vGIC、TUN/TAP、
 Linux bridge、crosvm 命令行兼容性和接口配置，失败时会给出具体项目。
+如果 Android 已占用 `2223` 或 `8080`，安装前修改对应端口。三个管理端口不能重复。
 
 修改后可直接同步到现有设备，不需要重新构建镜像：
 
@@ -67,7 +73,8 @@ Linux bridge、crosvm 命令行兼容性和接口配置，失败时会给出具�
 优先于 `config.env` 中的默认值。
 
 首次安装会下载官方镜像、校验 SHA-256、生成预配置 rootfs，再上传到
-`/data/local/openwrt`。如果目标设备已经存在 `openwrt.img`，`install` 会直接
+`/data/local/openwrt`。设备文件先写入临时目录并校验，完成后再切换到正式目录；
+启动失败时自动恢复 Android 网络。目标设备已经存在安装目录时，`install` 会
 拒绝执行，不会覆盖包含已安装软件和用户配置的现有虚拟磁盘。应先备份，确认
 备份有效后仅在明确需要重装时执行 `uninstall`，然后才能重新安装。
 部署器会在扩展后比较镜像的逻辑大小与实际分配块数；如果设备文件系统不支持
@@ -130,7 +137,7 @@ Linux bridge、crosvm 命令行兼容性和接口配置，失败时会给出具�
 | 用途 | 地址/接口 |
 | --- | --- |
 | OpenWrt LAN / LuCI / SSH | `192.168.88.1` |
-| Android 软桥管理地址 | `192.168.88.2` (`owrt-br`) |
+| Android 软桥 / UFI-Tools | `192.168.88.2` (`owrt-br`)，默认端口 `2333` |
 | OpenWrt WAN | `192.168.66.2` (`eth0`) |
 | Android WAN 端 | `192.168.66.1` (`owrt-wan`) |
 
@@ -146,6 +153,10 @@ Linux bridge、crosvm 命令行兼容性和接口配置，失败时会给出具�
 `192.168.88.2` 只用于 Android 宿主与 OpenWrt LAN 的管理/回程，不会成为
 Android 的默认路由。OpenWrt 仅管理桥接的热点和 USB 客户端；蜂窝拨号、
 SIM/APN、Android 应用及普通 Wi-Fi STA 始终由 Android 网络栈管理。
+
+UFI-Tools 服务运行时，热点或 USB 客户端通过 `http://192.168.88.2:2333` 访问
+高级后台。锁频、锁小区及 4G/5G 切换会短暂重建蜂窝上游，网络监控会在下一次
+状态变化时更新 OpenWrt WAN 路由。
 
 IPv4 始终由 OpenWrt DHCP/NAT 和防火墙管理。IPv6 由
 `IPV6_PASSTHROUGH` 决定。设为 `0` 时，设备管理器把蜂窝公网 `/64` 发布到
