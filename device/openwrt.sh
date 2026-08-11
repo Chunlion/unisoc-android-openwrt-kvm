@@ -144,6 +144,22 @@ is_tether_candidate() {
     matches_tether_pattern "$iface" && is_tethered "$iface"
 }
 
+# Interfaces that Android may turn into a DHCP server in the future.  This is
+# deliberately independent of TetheredState: IpServer can assign 42-49.1 and
+# answer the first DHCP request before the 3-second bridge monitor observes the
+# new state.  Blocking server replies on an inactive client interface is safe.
+is_tether_capable() {
+    iface="$1"
+    if [ "$TETHER_IFACE_PATTERNS" != auto ]; then
+        matches_tether_pattern "$iface"
+        return
+    fi
+    case "$iface" in
+        sipa_usb*|rndis*|wlan*|softap*|ap_br_wlan*|ap_br_softap*|bt-pan) return 0 ;;
+    esac
+    return 1
+}
+
 is_running() {
     [ -r "$PIDFILE" ] || return 1
     pid="$(cat "$PIDFILE" 2>/dev/null)"
@@ -512,7 +528,7 @@ sync_dhcp_block() {
     iptables -A OWT_OUT -o "$LAN_BRIDGE" -p udp --sport 67 --dport 68 -j DROP
     for path in /sys/class/net/*; do
         iface="${path##*/}"
-        is_tether_candidate "$iface" || continue
+        is_tether_capable "$iface" || continue
         iptables -A OWT_OUT -o "$iface" -p udp --sport 67 --dport 68 -j DROP
         if [ -d "$path/bridge" ]; then
             for member_path in "$path"/brif/*; do
@@ -526,6 +542,10 @@ sync_dhcp_block() {
 }
 
 setup_network() {
+    # Close the Android DHCP race before touching bridge membership.  A USB
+    # auto-enable daemon can start IpServer and emit a 192.168.42.x offer in
+    # the short interval before sync_bridge_ports sees TetheredState.
+    sync_dhcp_block
     for tap in "$WAN_TAP" "$LAN_TAP"; do
         ip tuntap add dev "$tap" mode tap 2>/dev/null || true
     done
