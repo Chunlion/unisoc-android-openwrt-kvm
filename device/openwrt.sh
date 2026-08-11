@@ -526,6 +526,16 @@ sync_dhcp_block() {
     iptables -N OWT_OUT 2>/dev/null || true
     iptables -F OWT_OUT
     iptables -A OWT_OUT -o "$LAN_BRIDGE" -p udp --sport 67 --dport 68 -j DROP
+    if [ "$TETHER_IFACE_PATTERNS" = auto ]; then
+        # iptables uses a trailing '+' as an interface-prefix wildcard.  Keep
+        # these rules even while USB gadget reconfiguration temporarily removes
+        # the netdev, so a newly recreated sipa_usb0/rndis0 cannot leak its
+        # first Android DHCP offer before the monitor sees /sys/class/net.
+        for iface_prefix in sipa_usb+ rndis+ wlan+ softap+ ap_br_wlan+ ap_br_softap+; do
+            iptables -A OWT_OUT -o "$iface_prefix" -p udp --sport 67 --dport 68 -j DROP
+        done
+        iptables -A OWT_OUT -o bt-pan -p udp --sport 67 --dport 68 -j DROP
+    fi
     for path in /sys/class/net/*; do
         iface="${path##*/}"
         is_tether_capable "$iface" || continue
