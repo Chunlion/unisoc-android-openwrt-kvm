@@ -18,6 +18,7 @@ BUNDLED_CROSVM="$SCRIPT_DIR/assets/crosvm/android13/crosvm"
 DEVICE_DIR=/data/local/openwrt
 DEVICE_NEW_DIR=/data/local/openwrt.new
 STAGE_DIR=/data/local/tmp/openwrt-deploy
+RESTORE_STAGE=/data/local/tmp/openwrt-restore
 if [[ -z "${ADB_BIN:-}" ]]; then
     # Pick the executable independently of device count. `adb get-state`
     # returns an error when several devices are present, which must not be
@@ -40,7 +41,9 @@ DISK_SIZE="${DISK_SIZE:-8G}"
 # for first-boot package metadata; Android extends it sparsely to DISK_SIZE
 # after upload and OpenWrt grows ext4 online.
 TRANSFER_DISK_SIZE="${TRANSFER_DISK_SIZE:-128M}"
-VM_CPUS="${VM_CPUS:-6}"
+VM_CPUS="${VM_CPUS:-4}"
+VM_CPU_AFFINITY="${VM_CPU_AFFINITY:-auto}"
+VM_NET_QUEUES="${VM_NET_QUEUES:-auto}"
 VM_MEMORY_MIB="${VM_MEMORY_MIB:-1024}"
 SSH_DNAT_PORT="${SSH_DNAT_PORT:-2223}"
 WEB_DNAT_PORT="${WEB_DNAT_PORT:-8080}"
@@ -319,6 +322,15 @@ validate_config() {
         die "IPV6_PASSTHROUGH must be 0 or 1"
     [[ "$DEVICE_MODEL" == auto ]] || validate_device_model "$DEVICE_MODEL"
     [[ "$VM_CPUS" =~ ^[1-9][0-9]*$ ]] || die "VM_CPUS must be a positive integer"
+    [[ "$VM_CPU_AFFINITY" == auto || "$VM_CPU_AFFINITY" == none || \
+       "$VM_CPU_AFFINITY" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ || \
+       "$VM_CPU_AFFINITY" =~ ^[0-9]+=[0-9]+(:[0-9]+=[0-9]+)*$ ]] || \
+        die "VM_CPU_AFFINITY must be auto, none, a CPU set, or a guest=host mapping"
+    [[ "$VM_NET_QUEUES" == auto || "$VM_NET_QUEUES" =~ ^[1-9][0-9]*$ ]] || \
+        die "VM_NET_QUEUES must be auto or a positive integer"
+    if [[ "$VM_NET_QUEUES" != auto ]] && ((VM_NET_QUEUES > VM_CPUS)); then
+        die "VM_NET_QUEUES cannot exceed VM_CPUS"
+    fi
     [[ "$VM_MEMORY_MIB" =~ ^[1-9][0-9]*$ ]] || die "VM_MEMORY_MIB must be a positive integer"
     local port
     for port in "$SSH_DNAT_PORT" "$WEB_DNAT_PORT" "$UFI_TOOLS_PORT"; do
@@ -385,6 +397,8 @@ write_vm_config() {
     cat > "$output" <<EOF
 ROOT_DEVICE='/dev/vda'
 VM_CPUS='$VM_CPUS'
+VM_CPU_AFFINITY='$VM_CPU_AFFINITY'
+VM_NET_QUEUES='$VM_NET_QUEUES'
 VM_MEMORY_MIB='$VM_MEMORY_MIB'
 DISK_SIZE='$DISK_SIZE'
 AUTO_TAKEOVER='$AUTO_TAKEOVER'
@@ -673,13 +687,30 @@ require_install() {
     device_has_manager || die "OpenWrt is not installed; run install first"
 }
 
+read_vm_status() {
+    local output rc=0
+    if output="$(device_manager status | tr -d '\r')"; then
+        :
+    else
+        rc=$?
+    fi
+    case "$output" in
+        running*|stopped)
+            printf '%s\n' "$output"
+            return 0
+            ;;
+    esac
+    echo "deploy-openwrt: cannot query VM state (rc=$rc): ${output:-no status returned}" >&2
+    return 1
+}
+
 backup_vm() {
     (($# <= 1)) || die "usage: ./deploy-openwrt.sh backup [OUTPUT.img.gz]"
     check_device
     device_has_manager || die "OpenWrt is not installed; nothing to back up"
     device_has_image || die "device manager exists but $DEVICE_DIR/openwrt.img is missing"
 
-    local serial_safe timestamp output output_dir output_name partial status
+    local serial_safe timestamp output output_dir output_name partial status kernel_sha256
     local was_running=0
     serial_safe="${ADB_SERIAL//[^A-Za-z0-9_.-]/_}"
     timestamp="$(date +%Y%m%d-%H%M%S)"
@@ -693,8 +724,10 @@ backup_vm() {
     command -v gzip >/dev/null 2>&1 || die "local gzip is required to verify the backup"
     adb_cmd shell "su 0 sh -c 'command -v gzip >/dev/null'" >/dev/null 2>&1 || \
         die "device gzip is unavailable"
+    kernel_sha256="$(adb_cmd shell "su 0 sh -c 'sha256sum $DEVICE_DIR/Image'" | tr -d '\r' | awk '{print $1}')"
+    [[ "$kernel_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || die "cannot record VM kernel checksum"
 
-    status="$(device_manager status | tr -d '\r')"
+    status="$(read_vm_status)" || die "cannot determine VM state before backup"
     case "$status" in
         running*)
             was_running=1
@@ -720,8 +753,9 @@ backup_vm() {
         cd -- "$output_dir"
         sha256sum -- "$output_name" > "$output_name.sha256"
     )
-    printf 'adb_serial=%s\ncreated_at=%s\n%s\n' \
-        "$ADB_SERIAL" "$(date --iso-8601=seconds)" "$image_stats" > "$output.info"
+    printf 'adb_serial=%s\ncreated_at=%s\nopenwrt_version=%s\nkernel_sha256=%s\n%s\n' \
+        "$ADB_SERIAL" "$(date --iso-8601=seconds)" "$OPENWRT_VERSION" "$kernel_sha256" \
+        "$image_stats" > "$output.info"
 
     if [[ "$was_running" == 1 ]]; then
         say "Restarting OpenWrt"
@@ -733,6 +767,130 @@ backup_vm() {
     echo "SHA-256: $output.sha256"
 }
 
+build_restore_helper() {
+    local helper_description
+    mkdir -p "$BUILD_DIR/tools"
+    say "Building Android ARM64 sparse restore helper"
+    aarch64-linux-gnu-gcc -O2 -static -s -Wall -Wextra \
+        -o "$BUILD_DIR/tools/sparse-writer" "$SCRIPT_DIR/tools/sparse_writer.c"
+    helper_description="$(file "$BUILD_DIR/tools/sparse-writer")" || \
+        die "cannot inspect sparse restore helper"
+    echo "$helper_description"
+    [[ "$helper_description" == *"ARM aarch64"* && "$helper_description" == *"statically linked"* ]] || \
+        die "sparse restore helper is not a static ARM64 executable"
+    return 0
+}
+
+restore_vm() {
+    (($# == 1)) || die "usage: ./deploy-openwrt.sh restore BACKUP.img.gz"
+    local backup="$1" checksum_file="$1.sha256" info_file="$1.info"
+    local expected_checksum actual_checksum expected_logical=0 expected_kernel=""
+    local actual_kernel image_stats logical allocated status
+    local was_running=0 old_saved=0 restore_complete=0
+    local remote_backup="$RESTORE_STAGE/backup.img.gz"
+    local remote_image="$RESTORE_STAGE/openwrt.img"
+    local remote_helper="$RESTORE_STAGE/sparse-writer"
+    local old_image="$DEVICE_DIR/openwrt.img.restore-old"
+
+    [[ -f "$backup" ]] || die "backup does not exist: $backup"
+    [[ -f "$checksum_file" ]] || die "backup checksum is missing: $checksum_file"
+    command -v gzip >/dev/null 2>&1 || die "local gzip is required"
+    gzip -t -- "$backup" || die "backup gzip verification failed"
+    read -r expected_checksum _ < "$checksum_file" || true
+    [[ "$expected_checksum" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid checksum file: $checksum_file"
+    expected_checksum="${expected_checksum,,}"
+    actual_checksum="$(sha256sum -- "$backup" | awk '{print $1}')"
+    [[ "$actual_checksum" == "$expected_checksum" ]] || \
+        die "backup checksum mismatch (expected $expected_checksum, got $actual_checksum)"
+    if [[ -r "$info_file" ]]; then
+        expected_logical="$(awk -F= '$1 == "logical_bytes" && $2 ~ /^[0-9]+$/ { print $2; exit }' "$info_file")"
+        : "${expected_logical:=0}"
+        expected_kernel="$(awk -F= '$1 == "kernel_sha256" { print tolower($2); exit }' "$info_file")"
+        [[ -z "$expected_kernel" || "$expected_kernel" =~ ^[0-9a-f]{64}$ ]] || \
+            die "invalid kernel checksum in $info_file"
+    fi
+
+    check_device
+    device_has_manager || die "OpenWrt VM shell is not installed; run install first, then restore"
+    device_has_image || die "installed VM image is missing: $DEVICE_DIR/openwrt.img"
+    if [[ -n "$expected_kernel" ]]; then
+        actual_kernel="$(adb_cmd shell "su 0 sh -c 'sha256sum $DEVICE_DIR/Image'" | tr -d '\r' | awk '{print tolower($1)}')"
+        [[ "$actual_kernel" == "$expected_kernel" ]] || \
+            die "backup kernel does not match the installed VM shell; reinstall the matching OpenWrt version first"
+    else
+        echo "deploy-openwrt: legacy backup has no kernel checksum; using the currently installed kernel" >&2
+    fi
+    adb_cmd shell "su 0 sh -c 'test ! -e $old_image'" >/dev/null 2>&1 || \
+        die "a previous recovery image still exists: $old_image"
+    install_dependencies
+    build_restore_helper
+
+    status="$(read_vm_status)" || \
+        die "cannot query VM state before restore; check the ADB connection"
+    case "$status" in
+        running*)
+            was_running=1
+            say "Stopping OpenWrt for image restore"
+            device_manager stop
+            ;;
+        stopped) ;;
+        *) die "cannot determine VM state: $status" ;;
+    esac
+
+    restore_rollback() {
+        local rc=$?
+        set +e
+        if [[ "$restore_complete" != 1 && "$old_saved" == 1 ]]; then
+            device_manager stop >/dev/null 2>&1 || true
+            adb_cmd shell "su 0 sh -c 'rm -f $DEVICE_DIR/openwrt.img && mv $old_image $DEVICE_DIR/openwrt.img && chmod 600 $DEVICE_DIR/openwrt.img && chown root:root $DEVICE_DIR/openwrt.img && sync'" >/dev/null 2>&1 || true
+        fi
+        adb_cmd shell "su 0 sh -c 'rm -rf -- $RESTORE_STAGE'" >/dev/null 2>&1 || true
+        if [[ "$was_running" == 1 ]]; then
+            device_manager start >/dev/null 2>&1 || true
+        fi
+        return "$rc"
+    }
+    trap restore_rollback EXIT
+
+    say "Uploading and verifying backup"
+    # adb push runs as Android's shell user, so the staging directory must be
+    # created by that user.  Root still owns the uploaded files before they are
+    # consumed and performs the final image replacement.
+    adb_cmd shell "su 0 sh -c 'rm -rf -- $RESTORE_STAGE'"
+    adb_cmd shell "mkdir -p '$RESTORE_STAGE' && chmod 700 '$RESTORE_STAGE'"
+    adb_cmd push "$(adb_path "$backup")" "$remote_backup"
+    adb_cmd push "$(adb_path "$BUILD_DIR/tools/sparse-writer")" "$remote_helper"
+    adb_cmd shell "su 0 sh -c 'chown root:root $remote_backup $remote_helper && chmod 600 $remote_backup && chmod 700 $remote_helper'"
+    verify_device_sha256 "$backup" "$remote_backup"
+    verify_device_sha256 "$BUILD_DIR/tools/sparse-writer" "$remote_helper"
+
+    say "Restoring sparse VM image"
+    adb_cmd shell "su 0 sh -c 'rm -f $remote_image && gzip -dc $remote_backup | $remote_helper $remote_image && chmod 600 $remote_image && chown root:root $remote_image && sync'"
+    image_stats="$(adb_cmd shell "su 0 sh -c 'logical=\$(stat -c %s $remote_image) && blocks=\$(stat -c %b $remote_image) && echo logical=\$logical && echo allocated=\$((blocks * 512))'" | tr -d '\r')"
+    logical="$(awk -F= '$1 == "logical" { print $2 }' <<<"$image_stats")"
+    allocated="$(awk -F= '$1 == "allocated" { print $2 }' <<<"$image_stats")"
+    [[ "$logical" =~ ^[0-9]+$ && "$allocated" =~ ^[0-9]+$ && "$logical" -ge 16777216 ]] || \
+        die "restored image has invalid statistics: $image_stats"
+    if ((expected_logical > 0 && logical != expected_logical)); then
+        die "restored logical size mismatch (expected $expected_logical, got $logical)"
+    fi
+    echo "logical=$logical allocated=$allocated"
+
+    say "Atomically replacing the VM disk"
+    adb_cmd shell "su 0 sh -c 'mv $DEVICE_DIR/openwrt.img $old_image && mv $remote_image $DEVICE_DIR/openwrt.img && chmod 600 $DEVICE_DIR/openwrt.img && chown root:root $DEVICE_DIR/openwrt.img && sync'"
+    old_saved=1
+    device_manager preflight
+    if [[ "$was_running" == 1 ]]; then
+        device_manager start
+    fi
+    adb_cmd shell "su 0 sh -c 'rm -f $old_image && rm -rf -- $RESTORE_STAGE && sync'"
+    old_saved=0
+    restore_complete=1
+    trap - EXIT
+    echo "VM image restored from: $backup"
+    echo "Restored disk: logical=$logical allocated=$allocated"
+}
+
 show_help() {
     cat <<EOF
 Usage: ./deploy-openwrt.sh COMMAND
@@ -740,6 +898,7 @@ Usage: ./deploy-openwrt.sh COMMAND
 Deployment:
   install          Build and install OpenWrt, then start it
   backup [FILE]    Stop briefly and save the current VM disk as .img.gz
+  restore FILE     Verify and restore a backup into an installed VM shell
   prepare          Download and prepare the local image only
   update           Update device tools and restart OpenWrt
   update-script    Update device tools without restarting OpenWrt
@@ -767,6 +926,7 @@ case "${1:-help}" in
     help|-h|--help) show_help ;;
     install|deploy) deploy ;;
     backup) shift; backup_vm "$@" ;;
+    restore) shift; restore_vm "$@" ;;
     prepare)
         validate_config
         install_dependencies
@@ -782,9 +942,9 @@ case "${1:-help}" in
     apply-config) apply_config ;;
     show-config)
         validate_config
-        printf 'CONFIG_FILE=%s\nOPENWRT_VERSION=%s\nOPENWRT_TARGET=%s\nDEVICE_MODEL=%s\nDISK_SIZE=%s\nTRANSFER_DISK_SIZE=%s\nVM_CPUS=%s\nVM_MEMORY_MIB=%s\nAUTO_TAKEOVER=%s\nIPV6_PASSTHROUGH=%s\nCROSVM_PATH=%s\nCELLULAR_IFACE=%s\nCELLULAR_ROUTE_TABLE=%s\nTETHER_IFACE_PATTERNS=%s\nSSH_DNAT_PORT=%s\nWEB_DNAT_PORT=%s\nUFI_TOOLS_PORT=%s\nWAN_DNS1=%s\nWAN_DNS2=%s\n' \
+        printf 'CONFIG_FILE=%s\nOPENWRT_VERSION=%s\nOPENWRT_TARGET=%s\nDEVICE_MODEL=%s\nDISK_SIZE=%s\nTRANSFER_DISK_SIZE=%s\nVM_CPUS=%s\nVM_CPU_AFFINITY=%s\nVM_NET_QUEUES=%s\nVM_MEMORY_MIB=%s\nAUTO_TAKEOVER=%s\nIPV6_PASSTHROUGH=%s\nCROSVM_PATH=%s\nCELLULAR_IFACE=%s\nCELLULAR_ROUTE_TABLE=%s\nTETHER_IFACE_PATTERNS=%s\nSSH_DNAT_PORT=%s\nWEB_DNAT_PORT=%s\nUFI_TOOLS_PORT=%s\nWAN_DNS1=%s\nWAN_DNS2=%s\n' \
             "$CONFIG_FILE" "$OPENWRT_VERSION" "$OPENWRT_TARGET" "$DEVICE_MODEL" "$DISK_SIZE" \
-            "$TRANSFER_DISK_SIZE" "$VM_CPUS" "$VM_MEMORY_MIB" "$AUTO_TAKEOVER" "$IPV6_PASSTHROUGH" \
+            "$TRANSFER_DISK_SIZE" "$VM_CPUS" "$VM_CPU_AFFINITY" "$VM_NET_QUEUES" "$VM_MEMORY_MIB" "$AUTO_TAKEOVER" "$IPV6_PASSTHROUGH" \
             "$CROSVM_PATH" "$CELLULAR_IFACE" "$CELLULAR_ROUTE_TABLE" "$TETHER_IFACE_PATTERNS" \
             "$SSH_DNAT_PORT" "$WEB_DNAT_PORT" "$UFI_TOOLS_PORT" \
             "$WAN_DNS1" "$WAN_DNS2"

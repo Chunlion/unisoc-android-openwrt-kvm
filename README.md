@@ -32,7 +32,7 @@ chmod +x deploy-openwrt.sh
 也可以在首次安装时指定密码和资源参数：
 
 ```bash
-OPENWRT_PASSWORD='新密码' VM_CPUS=6 VM_MEMORY_MIB=1024 DISK_SIZE=8G \
+OPENWRT_PASSWORD='新密码' VM_CPUS=4 VM_CPU_AFFINITY=auto VM_MEMORY_MIB=1024 DISK_SIZE=8G \
   ./deploy-openwrt.sh install
 ```
 
@@ -40,6 +40,15 @@ OPENWRT_PASSWORD='新密码' VM_CPUS=6 VM_MEMORY_MIB=1024 DISK_SIZE=8G \
 
 ```bash
 DEVICE_MODEL=auto  # 安装时从目标 ADB 设备自动生成；也可手动填写显示名称
+
+VM_CPUS=4              # 默认使用四个 vCPU
+VM_CPU_AFFINITY=auto   # 自动一一绑定到当前 Android 最快的四个在线核心
+VM_NET_QUEUES=auto     # 支持时启用与 vCPU 数量相同的 virtio-net 多队列
+# VM_CPU_AFFINITY=none             # 不绑核，交给 Android 调度
+# VM_CPU_AFFINITY='0=4:1=5:2=6:3=0' # 也可以显式指定 guest=host 映射
+
+# 使用 auto 时还会向 OpenWrt 描述大小核 capacity 和 cluster，
+# 让 Clash 等重负载优先调度到大核。
 
 AUTO_TAKEOVER=0  # Android/SIM/应用直连，只有热点和 USB 客户端走 OpenWrt
 AUTO_TAKEOVER=1  # Android 本机应用流量也由 OpenWrt 接管
@@ -105,6 +114,32 @@ Linux bridge、crosvm 命令行兼容性和接口配置，失败时会给出具�
 ./deploy-openwrt.sh logs 200
 ./deploy-openwrt.sh ssh
 ```
+
+也可以完全脱离电脑端部署脚本，在 Android 的 ADB root shell 中管理已经安装的
+VM：
+
+```sh
+adb shell
+su
+/data/local/openwrt/openwrt.sh status
+/data/local/openwrt/openwrt.sh start
+/data/local/openwrt/openwrt.sh stop
+/data/local/openwrt/openwrt.sh restart
+/data/local/openwrt/openwrt.sh logs 200
+```
+
+或者直接从电脑执行单条命令：
+
+```sh
+adb shell "su 0 sh -c '/data/local/openwrt/openwrt.sh status'"
+adb shell "su 0 sh -c '/data/local/openwrt/openwrt.sh start'"
+adb shell "su 0 sh -c '/data/local/openwrt/openwrt.sh stop'"
+adb shell "su 0 sh -c '/data/local/openwrt/openwrt.sh restart'"
+```
+
+应始终使用 `openwrt.sh` 启停，不要直接 `kill` crosvm；管理脚本会同时建立或
+还原 TAP、网桥、转发规则、DHCP 防护及 Android 网络状态。镜像备份和恢复仍应
+使用电脑端的 `deploy-openwrt.sh backup` 与 `deploy-openwrt.sh restore`。
 
 修改 `device/openwrt.sh` 后，不需要重新构建和上传镜像：
 

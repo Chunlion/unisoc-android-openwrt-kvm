@@ -46,6 +46,10 @@ WEB_DNAT_PORT=8080
 UFI_TOOLS_PORT=2333
 START_TIMEOUT_SECONDS=30
 LOCK_HELD=0
+EFFECTIVE_CPU_AFFINITY=""
+EFFECTIVE_CPU_CAPACITY=""
+EFFECTIVE_CPU_CLUSTERS=""
+EFFECTIVE_NET_QUEUES=1
 
 die() {
     echo "openwrt: $*" >&2
@@ -66,7 +70,9 @@ load_config() {
     # shellcheck source=/dev/null
     . "$CONFIG"
     : "${ROOT_DEVICE:=/dev/vda}"
-    : "${VM_CPUS:=6}"
+    : "${VM_CPUS:=4}"
+    : "${VM_CPU_AFFINITY:=auto}"
+    : "${VM_NET_QUEUES:=auto}"
     : "${VM_MEMORY_MIB:=1024}"
     : "${AUTO_TAKEOVER:=0}"
     : "${IPV6_PASSTHROUGH:=1}"
@@ -133,6 +139,85 @@ detect_cellular_iface() {
     return 1
 }
 
+resolve_cpu_affinity() {
+    EFFECTIVE_CPU_AFFINITY=""
+    EFFECTIVE_CPU_CAPACITY=""
+    EFFECTIVE_CPU_CLUSTERS=""
+    case "$VM_CPU_AFFINITY" in
+        none) return 0 ;;
+        auto)
+            selected_cpus="$(
+                for cpu_path in /sys/devices/system/cpu/cpu[0-9]*; do
+                    cpu_id="${cpu_path##*cpu}"
+                    if [ -r "$cpu_path/online" ] && [ "$(cat "$cpu_path/online" 2>/dev/null)" != 1 ]; then
+                        continue
+                    fi
+                    cpu_score="$(cat "$cpu_path/cpu_capacity" 2>/dev/null)"
+                    [ -n "$cpu_score" ] || cpu_score="$(cat "$cpu_path/cpufreq/cpuinfo_max_freq" 2>/dev/null)"
+                    case "$cpu_score" in *[!0-9]*|'') cpu_score=0 ;; esac
+                    echo "$cpu_score $cpu_id"
+                done | sort -k1,1nr -k2,2n | head -n "$VM_CPUS"
+            )"
+            selected_count="$(printf '%s\n' "$selected_cpus" | sed '/^$/d' | wc -l | tr -d ' ')"
+            [ "$selected_count" = "$VM_CPUS" ] || \
+                die "VM_CPUS=$VM_CPUS exceeds the number of online Android CPUs ($selected_count)"
+            EFFECTIVE_CPU_AFFINITY="$(printf '%s\n' "$selected_cpus" | awk '
+                { if (NR > 1) printf ":"; printf "%d=%s", NR - 1, $2 }
+                END { print "" }
+            ')"
+            # Tell the guest scheduler that a vCPU pinned to a little core is
+            # not equivalent to one pinned to a big core. Normalize either
+            # cpu_capacity or the cpufreq fallback to crosvm's 1024 scale.
+            EFFECTIVE_CPU_CAPACITY="$(printf '%s\n' "$selected_cpus" | awk '
+                NR == 1 { max = $1 }
+                {
+                    capacity = max > 0 ? int(($1 * 1024 + max / 2) / max) : 1024
+                    if (capacity < 1) capacity = 1
+                    if (NR > 1) printf ","
+                    printf "%d=%d", NR - 1, capacity
+                }
+                END { print "" }
+            ')"
+            # selected_cpus is capacity-sorted, so equal-capacity vCPUs are
+            # contiguous and can be represented as crosvm CPU clusters.
+            EFFECTIVE_CPU_CLUSTERS="$(printf '%s\n' "$selected_cpus" | awk '
+                function emit(first, last) {
+                    if (output != "") output = output " "
+                    output = output (first == last ? first : first "-" last)
+                }
+                NR == 1 { previous = $1; first = 0; next }
+                $1 != previous { emit(first, NR - 2); first = NR - 1; previous = $1 }
+                END { if (NR > 0) emit(first, NR - 1); print output }
+            ')"
+            ;;
+        *[!0-9,:=-]*|'') die "invalid VM_CPU_AFFINITY: $VM_CPU_AFFINITY" ;;
+        *) EFFECTIVE_CPU_AFFINITY="$VM_CPU_AFFINITY" ;;
+    esac
+}
+
+resolve_net_queues() {
+    case "$VM_NET_QUEUES" in
+        auto)
+            if echo "$crosvm_help" | grep -q -- '--net-vq-pairs'; then
+                EFFECTIVE_NET_QUEUES="$VM_CPUS"
+            else
+                EFFECTIVE_NET_QUEUES=1
+            fi
+            ;;
+        *[!0-9]*|'') die "VM_NET_QUEUES must be auto or a positive integer" ;;
+        0) die "VM_NET_QUEUES must be positive" ;;
+        *)
+            [ "$VM_NET_QUEUES" -le "$VM_CPUS" ] || \
+                die "VM_NET_QUEUES cannot exceed VM_CPUS"
+            EFFECTIVE_NET_QUEUES="$VM_NET_QUEUES"
+            if [ "$EFFECTIVE_NET_QUEUES" -gt 1 ] && \
+                    ! echo "$crosvm_help" | grep -q -- '--net-vq-pairs'; then
+                die "selected crosvm does not support --net-vq-pairs"
+            fi
+            ;;
+    esac
+}
+
 resolve_device_config() {
     case "$CROSVM_PATH" in
         auto)
@@ -159,6 +244,20 @@ resolve_device_config() {
         CROSVM_STYLE=rwdisk
     else
         die "unsupported crosvm command line: neither --block nor --rwdisk is available"
+    fi
+    resolve_cpu_affinity
+    resolve_net_queues
+    if [ -n "$EFFECTIVE_CPU_AFFINITY" ] && \
+            ! echo "$crosvm_help" | grep -q -- '--cpu-affinity'; then
+        die "selected crosvm does not support --cpu-affinity"
+    fi
+    if [ -n "$EFFECTIVE_CPU_CAPACITY" ] && \
+            ! echo "$crosvm_help" | grep -q -- '--cpu-capacity'; then
+        die "selected crosvm does not support --cpu-capacity"
+    fi
+    if [ -n "$EFFECTIVE_CPU_CLUSTERS" ] && \
+            ! echo "$crosvm_help" | grep -q -- '--cpu-cluster'; then
+        die "selected crosvm does not support --cpu-cluster"
     fi
 
     if [ "$CELLULAR_IFACE" = auto ]; then
@@ -651,7 +750,21 @@ setup_network() {
     # the short interval before sync_bridge_ports sees TetheredState.
     sync_dhcp_block
     for tap in "$WAN_TAP" "$LAN_TAP"; do
-        ip tuntap add dev "$tap" mode tap 2>/dev/null || true
+        ip link set dev "$tap" nomaster 2>/dev/null || true
+        ip tuntap del dev "$tap" mode tap 2>/dev/null || ip link delete "$tap" 2>/dev/null || true
+        if [ "$EFFECTIVE_NET_QUEUES" -gt 1 ]; then
+            if ! ip tuntap add dev "$tap" mode tap multi_queue 2>/dev/null; then
+                if [ "$VM_NET_QUEUES" = auto ]; then
+                    echo "openwrt: multiqueue TAP unavailable; falling back to one queue" >&2
+                    EFFECTIVE_NET_QUEUES=1
+                    ip tuntap add dev "$tap" mode tap
+                else
+                    die "cannot create multiqueue TAP $tap"
+                fi
+            fi
+        else
+            ip tuntap add dev "$tap" mode tap
+        fi
     done
     ip addr flush dev "$WAN_TAP" 2>/dev/null
     ip addr add "$WAN_HOST_IP/24" dev "$WAN_TAP"
@@ -896,7 +1009,19 @@ preflight_vm() {
     probe_bridge=owrt-checkbr
     ip link delete "$probe_tap" 2>/dev/null || true
     ip link delete "$probe_bridge" type bridge 2>/dev/null || true
-    ip tuntap add dev "$probe_tap" mode tap || die "kernel cannot create TAP interfaces"
+    if [ "$EFFECTIVE_NET_QUEUES" -gt 1 ]; then
+        if ! ip tuntap add dev "$probe_tap" mode tap multi_queue 2>/dev/null; then
+            if [ "$VM_NET_QUEUES" = auto ]; then
+                EFFECTIVE_NET_QUEUES=1
+                ip tuntap add dev "$probe_tap" mode tap || \
+                    die "kernel cannot create TAP interfaces"
+            else
+                die "kernel cannot create multiqueue TAP interfaces"
+            fi
+        fi
+    else
+        ip tuntap add dev "$probe_tap" mode tap || die "kernel cannot create TAP interfaces"
+    fi
     ip link add name "$probe_bridge" type bridge || {
         ip link delete "$probe_tap" 2>/dev/null || true
         die "kernel cannot create Linux bridges"
@@ -911,7 +1036,7 @@ preflight_vm() {
     done
     [ -n "$matched" ] || \
         die "TETHER_IFACE_PATTERNS matches no current interface"
-    echo "preflight ok: crosvm=$CROSVM style=$CROSVM_STYLE cellular=$CELLULAR_IFACE table=$CELLULAR_ROUTE_TABLE tether=${TETHER_IFACE_PATTERNS} ipv6_passthrough=$IPV6_PASSTHROUGH"
+    echo "preflight ok: crosvm=$CROSVM style=$CROSVM_STYLE cpus=$VM_CPUS affinity=${EFFECTIVE_CPU_AFFINITY:-none} capacity=${EFFECTIVE_CPU_CAPACITY:-none} clusters=${EFFECTIVE_CPU_CLUSTERS:-none} net_queues=$EFFECTIVE_NET_QUEUES cellular=$CELLULAR_IFACE table=$CELLULAR_ROUTE_TABLE tether=${TETHER_IFACE_PATTERNS} ipv6_passthrough=$IPV6_PASSTHROUGH"
 }
 
 start_vm() {
@@ -932,32 +1057,32 @@ start_vm() {
         rollback_failed_start
         die "failed to configure VM networking; Android networking was restored"
     fi
-
-    if [ "$CROSVM_STYLE" = block ]; then
-        nohup "$CROSVM" run \
-            --disable-sandbox \
-            --cpus "$VM_CPUS" \
-            --mem "$VM_MEMORY_MIB" \
-            --socket "$SOCKET" \
-            --serial "type=file,path=$CONSOLE,hardware=serial,num=1,console" \
-            --block "path=$DISK,root=false" \
-            --tap-name "$WAN_TAP" \
-            --tap-name "$LAN_TAP" \
-            --params "root=$ROOT_DEVICE rw rootwait console=ttyS0 console=ttyAMA0 owrt_ipv6_passthrough=$IPV6_PASSTHROUGH" \
-            "$KERNEL" </dev/null >>"$LOG" 2>&1 &
-    else
-        nohup "$CROSVM" run \
-            --disable-sandbox \
-            --cpus "$VM_CPUS" \
-            --mem "$VM_MEMORY_MIB" \
-            --socket "$SOCKET" \
-            --serial "type=file,path=$CONSOLE,hardware=serial,num=1,console" \
-            --rwdisk "$DISK" \
-            --tap-name "$WAN_TAP" \
-            --tap-name "$LAN_TAP" \
-            --params "root=$ROOT_DEVICE rw rootwait console=ttyS0 console=ttyAMA0 owrt_ipv6_passthrough=$IPV6_PASSTHROUGH" \
-            "$KERNEL" </dev/null >>"$LOG" 2>&1 &
+    set -- "$CROSVM" run --disable-sandbox --cpus "$VM_CPUS"
+    if [ -n "$EFFECTIVE_CPU_AFFINITY" ]; then
+        set -- "$@" "--cpu-affinity=$EFFECTIVE_CPU_AFFINITY"
     fi
+    if [ -n "$EFFECTIVE_CPU_CAPACITY" ]; then
+        set -- "$@" "--cpu-capacity=$EFFECTIVE_CPU_CAPACITY"
+    fi
+    for cpu_cluster in $EFFECTIVE_CPU_CLUSTERS; do
+        set -- "$@" "--cpu-cluster=$cpu_cluster"
+    done
+    if [ "$CROSVM_STYLE" = block ]; then
+        set -- "$@" --block "path=$DISK,root=false"
+    else
+        set -- "$@" --rwdisk "$DISK"
+    fi
+    if [ "$EFFECTIVE_NET_QUEUES" -gt 1 ]; then
+        set -- "$@" "--net-vq-pairs=$EFFECTIVE_NET_QUEUES"
+    fi
+    set -- "$@" \
+        --mem "$VM_MEMORY_MIB" \
+        --socket "$SOCKET" \
+        --serial "type=file,path=$CONSOLE,hardware=serial,num=1,console" \
+        --tap-name "$WAN_TAP" \
+        --tap-name "$LAN_TAP" \
+        --params "root=$ROOT_DEVICE rw rootwait console=ttyS0 console=ttyAMA0 owrt_ipv6_passthrough=$IPV6_PASSTHROUGH"
+    nohup "$@" "$KERNEL" </dev/null >>"$LOG" 2>&1 &
     pid=$!
     echo "$pid" > "$PIDFILE"
     sleep 2
@@ -1028,7 +1153,7 @@ status_vm() {
         done
         ufi_state=stopped
         port_listening "$UFI_TOOLS_PORT" && ufi_state=running
-        echo "running PID=$(cat "$PIDFILE") wan=$WAN_GUEST_IP lan=$LAN_GUEST_IP bridge=$LAN_BRIDGE ports=${bridge_ports:-none} ipv6_passthrough=$IPV6_PASSTHROUGH ssh=host:$SSH_DNAT_PORT ufi=$ufi_state:$UFI_TOOLS_PORT"
+        echo "running PID=$(cat "$PIDFILE") wan=$WAN_GUEST_IP lan=$LAN_GUEST_IP bridge=$LAN_BRIDGE ports=${bridge_ports:-none} net_queues=$EFFECTIVE_NET_QUEUES ipv6_passthrough=$IPV6_PASSTHROUGH ssh=host:$SSH_DNAT_PORT ufi=$ufi_state:$UFI_TOOLS_PORT"
     else
         echo "stopped"
         return 1
