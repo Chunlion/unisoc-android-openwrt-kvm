@@ -7,7 +7,7 @@
 ## 当前功能
 
 - OpenWrt 25.12.5、Linux 6.12 ARM64
-- 6 vCPU、1 GiB 内存（均可配置）
+- 默认 4 vCPU、1 GiB 内存（均可配置）
 - 8 GiB 稀疏虚拟磁盘；初次只传输 128 MiB，设备端按需占用空间
 - 安装时自动读取 Android 厂商、型号、设备名和 SoC，LuCI 不再显示未知型号
 - Android 本机、SIM/APN 和应用流量保持由 Android 管理，不经 OpenWrt
@@ -100,6 +100,19 @@ Linux bridge、crosvm 命令行兼容性和接口配置，失败时会给出具�
 原先的运行状态。8 GiB 稀疏镜像在 Android 端压缩后再经 ADB 传输，本地文件
 大小主要取决于实际已用空间，而不是固定占用 8 GiB。默认保存到 `backups/`，
 同时生成 `.sha256` 校验文件和记录设备序列号、逻辑/实际占用大小的 `.info`。
+
+## 同步上游
+
+在需要部署的自有分支（例如 `main`）执行：
+
+```bash
+git switch main
+bash tools/sync-upstream.sh
+```
+
+脚本要求工作区干净，先快进同步你的 `origin` 分支，再合并 `upstream/main`，最后只推送回
+`origin` 当前分支；它会自动添加只读上游并禁止向上游推送。部署始终使用当前自有分支。
+如有冲突，解决并提交后再次运行该命令。
 
 ## 管理
 
