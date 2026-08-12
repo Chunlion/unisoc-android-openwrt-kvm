@@ -55,9 +55,9 @@ BASE_URL="https://downloads.openwrt.org/releases/$OPENWRT_VERSION/targets/$OPENW
 TARGET_BASENAME="${OPENWRT_TARGET//\//-}"
 KERNEL_NAME="openwrt-$OPENWRT_VERSION-$TARGET_BASENAME-generic-kernel.bin"
 ROOTFS_NAME="openwrt-$OPENWRT_VERSION-$TARGET_BASENAME-generic-ext4-rootfs.img.gz"
+CHECKSUM_CACHE_NAME="openwrt-$OPENWRT_VERSION-$TARGET_BASENAME.sha256sums"
 WAN_HOST_IP=192.168.66.1
 WAN_GUEST_IP=192.168.66.2
-LAN_HOST_IP=192.168.88.2
 LAN_GUEST_IP=192.168.88.1
 WAN_DNS1="${WAN_DNS1:-223.5.5.5}"
 WAN_DNS2="${WAN_DNS2:-8.8.8.8}"
@@ -90,8 +90,8 @@ adb_timed_cmd() {
 }
 
 adb_probe_cmd() {
-    local attempt rc=1
-    for attempt in 1 2; do
+    local rc=1
+    for _ in 1 2; do
         if adb_timed_cmd "$ADB_PROBE_TIMEOUT_SECONDS" "$@"; then
             return 0
         else
@@ -156,7 +156,19 @@ force_remove_device_vm() {
         for pidfile in $DEVICE_DIR/network-monitor.pid $DEVICE_DIR/crosvm.pid; do
             if test -r \"\$pidfile\"; then
                 pid=\$(cat \"\$pidfile\" 2>/dev/null)
-                case \"\$pid\" in *[!0-9]*|\"\") ;; *) kill \"\$pid\" 2>/dev/null || true ;; esac
+                case \"\$pidfile\" in
+                    *network-monitor.pid) expected=\"$DEVICE_DIR/openwrt.sh __network_monitor\" ;;
+                    *) expected=\"$DEVICE_DIR/openwrt.img\" ;;
+                esac
+                case \"\$pid\" in
+                    *[!0-9]*|\"\") ;;
+                    *)
+                        if test -r \"/proc/\$pid/cmdline\" && \
+                                tr \"\\000\" \" \" < \"/proc/\$pid/cmdline\" | grep -Fq \"\$expected\"; then
+                            kill \"\$pid\" 2>/dev/null || true
+                        fi
+                        ;;
+                esac
             fi
         done
         ip link delete owrt-br type bridge 2>/dev/null || true
@@ -251,6 +263,20 @@ validate_device_model() {
     ((${#model} <= 120)) || die "DEVICE_MODEL is too long (maximum 120 characters)"
 }
 
+size_to_bytes() {
+    local value="$1" number unit multiplier
+    [[ "$value" =~ ^([1-9][0-9]*)([KMG])$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    [[ ${#number} -le 9 ]] || return 1
+    case "$unit" in
+        K) multiplier=1024 ;;
+        M) multiplier=$((1024 * 1024)) ;;
+        G) multiplier=$((1024 * 1024 * 1024)) ;;
+    esac
+    printf '%s\n' "$((number * multiplier))"
+}
+
 resolve_device_model() {
     if [[ "$DEVICE_MODEL" != auto ]]; then
         validate_device_model "$DEVICE_MODEL"
@@ -283,6 +309,10 @@ resolve_device_model() {
 }
 
 validate_config() {
+    [[ "$OPENWRT_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && \
+       "$OPENWRT_VERSION" != *..* ]] || die "invalid OPENWRT_VERSION"
+    [[ "$OPENWRT_TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*/[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || \
+        die "invalid OPENWRT_TARGET"
     [[ "$AUTO_TAKEOVER" == 0 || "$AUTO_TAKEOVER" == 1 ]] || \
         die "AUTO_TAKEOVER must be 0 or 1"
     [[ "$IPV6_PASSTHROUGH" == 0 || "$IPV6_PASSTHROUGH" == 1 ]] || \
@@ -307,6 +337,15 @@ validate_config() {
     [[ "$CELLULAR_ROUTE_TABLE" =~ ^(auto|[A-Za-z0-9_.-]+)$ ]] || die "invalid CELLULAR_ROUTE_TABLE"
     [[ -n "$TETHER_IFACE_PATTERNS" && "$TETHER_IFACE_PATTERNS" =~ ^[A-Za-z0-9_.*?+-]+([[:space:]]+[A-Za-z0-9_.*?+-]+)*$ ]] || \
         die "invalid TETHER_IFACE_PATTERNS"
+    local dns disk_bytes transfer_bytes
+    for dns in "$WAN_DNS1" "$WAN_DNS2"; do
+        [[ "$dns" =~ ^[A-Za-z0-9_.:%-]+$ ]] || die "invalid WAN DNS server: $dns"
+    done
+    disk_bytes="$(size_to_bytes "$DISK_SIZE")" || die "invalid DISK_SIZE: $DISK_SIZE"
+    transfer_bytes="$(size_to_bytes "$TRANSFER_DISK_SIZE")" || \
+        die "invalid TRANSFER_DISK_SIZE: $TRANSFER_DISK_SIZE"
+    ((transfer_bytes <= disk_bytes)) || \
+        die "TRANSFER_DISK_SIZE must not exceed DISK_SIZE"
 }
 
 resolve_openwrt_password() {
@@ -369,24 +408,36 @@ verify_device_sha256() {
 }
 
 download_image() {
+    validate_config
     mkdir -p "$CACHE_DIR"
-    for f in "$KERNEL_NAME" "$ROOTFS_NAME" sha256sums; do
+    for f in "$KERNEL_NAME" "$ROOTFS_NAME"; do
         if [[ ! -s "$CACHE_DIR/$f" ]]; then
             say "Downloading $f"
             curl -fL --retry 3 -o "$CACHE_DIR/$f.part" "$BASE_URL/$f"
             mv "$CACHE_DIR/$f.part" "$CACHE_DIR/$f"
         fi
     done
+    if [[ ! -s "$CACHE_DIR/$CHECKSUM_CACHE_NAME" ]]; then
+        say "Downloading sha256sums"
+        curl -fL --retry 3 -o "$CACHE_DIR/$CHECKSUM_CACHE_NAME.part" "$BASE_URL/sha256sums"
+        mv "$CACHE_DIR/$CHECKSUM_CACHE_NAME.part" "$CACHE_DIR/$CHECKSUM_CACHE_NAME"
+    fi
     say "Verifying OpenWrt SHA-256 checksums"
-    (cd "$CACHE_DIR" && sha256sum -c --ignore-missing sha256sums 2>&1 | grep -Ei "OK|FAILED") || true
-    (cd "$CACHE_DIR" && sha256sum -c --ignore-missing sha256sums) >/dev/null || die "checksum mismatch"
+    for f in "$KERNEL_NAME" "$ROOTFS_NAME"; do
+        awk -v file="$f" '
+            { name = $2; sub(/^\*/, "", name); if (name == file) found = 1 }
+            END { exit !found }
+        ' "$CACHE_DIR/$CHECKSUM_CACHE_NAME" || \
+            die "checksum manifest does not contain $f"
+    done
+    (cd "$CACHE_DIR" && sha256sum -c --ignore-missing "$CHECKSUM_CACHE_NAME" 2>&1 | grep -Ei "OK|FAILED") || true
+    (cd "$CACHE_DIR" && sha256sum -c --ignore-missing "$CHECKSUM_CACHE_NAME") >/dev/null || \
+        die "checksum mismatch"
 }
 
 prepare_image() {
     validate_config
     resolve_openwrt_password
-    [[ "$DISK_SIZE" =~ ^[1-9][0-9]*[KMG]$ ]] || die "invalid DISK_SIZE: $DISK_SIZE"
-    [[ "$TRANSFER_DISK_SIZE" =~ ^[1-9][0-9]*[KMG]$ ]] || die "invalid TRANSFER_DISK_SIZE: $TRANSFER_DISK_SIZE"
     [[ "$BUILD_DIR" == "$SCRIPT_DIR/build" ]] || die "unsafe BUILD_DIR: $BUILD_DIR"
     rm -rf -- "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
@@ -394,6 +445,11 @@ prepare_image() {
 
     say "Unpacking rootfs"
     gzip -dc "$CACHE_DIR/$ROOTFS_NAME" > "$BUILD_DIR/openwrt.img"
+    local image_bytes transfer_bytes
+    image_bytes="$(stat -c %s "$BUILD_DIR/openwrt.img")"
+    transfer_bytes="$(size_to_bytes "$TRANSFER_DISK_SIZE")"
+    ((image_bytes <= transfer_bytes)) || \
+        die "TRANSFER_DISK_SIZE ($TRANSFER_DISK_SIZE) is smaller than the unpacked rootfs ($image_bytes bytes)"
 
     # Bake /etc/config/network. OpenWrt's /bin/config_generate only creates it
     # when missing, so our static WAN/LAN setup survives first boot.
@@ -453,7 +509,7 @@ EOF
     # Run twice: the first pass fixes the factory image, the second clears the
     # needs-fsck flag so resize2fs does not try to run e2fsck interactively.
     # e2fsck returns 1 when it corrected errors, which is fine here.
-    for pass in 1 2; do
+    for _ in 1 2; do
         local rc=0
         e2fsck -fy "$BUILD_DIR/openwrt.img" || rc=$?
         ((rc <= 1)) || die "e2fsck failed with rc=$rc"
@@ -483,6 +539,7 @@ EOF
 }
 
 deploy() {
+    validate_config
     check_device
     check_install_device
     # Refuse before doing downloads/build work, then check again immediately
@@ -564,6 +621,7 @@ EOF
 
 update_manager() {
     local restart="${1:-1}"
+    validate_config
     install_dependencies
     check_device
     device_has_manager || die "OpenWrt is not installed; run install first"
@@ -573,7 +631,11 @@ update_manager() {
     adb_cmd push "$(adb_path "$BUILD_DIR/tools/ra6")" /data/local/tmp/ra6.new
     adb_cmd push "$(adb_path "$BUILD_DIR/tools/kvm-probe")" /data/local/tmp/kvm-probe.new
     adb_cmd push "$(adb_path "$BUNDLED_CROSVM")" /data/local/tmp/crosvm.new
-    adb_cmd shell "su 0 sh -c 'cp /data/local/tmp/openwrt.sh.new $DEVICE_DIR/openwrt.sh && cp /data/local/tmp/ra6.new $DEVICE_DIR/ra6.next && cp /data/local/tmp/kvm-probe.new $DEVICE_DIR/kvm-probe.next && cp /data/local/tmp/crosvm.new $DEVICE_DIR/crosvm.next && chown root:root $DEVICE_DIR/openwrt.sh $DEVICE_DIR/ra6.next $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/crosvm.next && chmod 700 $DEVICE_DIR/openwrt.sh $DEVICE_DIR/ra6.next $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/crosvm.next && mv -f $DEVICE_DIR/ra6.next $DEVICE_DIR/ra6 && mv -f $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/kvm-probe && mv -f $DEVICE_DIR/crosvm.next $DEVICE_DIR/crosvm && rm -f /data/local/tmp/openwrt.sh.new /data/local/tmp/ra6.new /data/local/tmp/kvm-probe.new /data/local/tmp/crosvm.new && sync'"
+    verify_device_sha256 "$SCRIPT_DIR/device/openwrt.sh" /data/local/tmp/openwrt.sh.new
+    verify_device_sha256 "$BUILD_DIR/tools/ra6" /data/local/tmp/ra6.new
+    verify_device_sha256 "$BUILD_DIR/tools/kvm-probe" /data/local/tmp/kvm-probe.new
+    verify_device_sha256 "$BUNDLED_CROSVM" /data/local/tmp/crosvm.new
+    adb_cmd shell "su 0 sh -c 'cp /data/local/tmp/openwrt.sh.new $DEVICE_DIR/openwrt.sh.next && cp /data/local/tmp/ra6.new $DEVICE_DIR/ra6.next && cp /data/local/tmp/kvm-probe.new $DEVICE_DIR/kvm-probe.next && cp /data/local/tmp/crosvm.new $DEVICE_DIR/crosvm.next && chown root:root $DEVICE_DIR/openwrt.sh.next $DEVICE_DIR/ra6.next $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/crosvm.next && chmod 700 $DEVICE_DIR/openwrt.sh.next $DEVICE_DIR/ra6.next $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/crosvm.next && mv -f $DEVICE_DIR/openwrt.sh.next $DEVICE_DIR/openwrt.sh && mv -f $DEVICE_DIR/ra6.next $DEVICE_DIR/ra6 && mv -f $DEVICE_DIR/kvm-probe.next $DEVICE_DIR/kvm-probe && mv -f $DEVICE_DIR/crosvm.next $DEVICE_DIR/crosvm && rm -f /data/local/tmp/openwrt.sh.new /data/local/tmp/ra6.new /data/local/tmp/kvm-probe.new /data/local/tmp/crosvm.new && sync'"
     verify_device_sha256 "$SCRIPT_DIR/device/openwrt.sh" "$DEVICE_DIR/openwrt.sh"
     verify_device_sha256 "$BUILD_DIR/tools/ra6" "$DEVICE_DIR/ra6"
     verify_device_sha256 "$BUILD_DIR/tools/kvm-probe" "$DEVICE_DIR/kvm-probe"
@@ -706,6 +768,7 @@ case "${1:-help}" in
     install|deploy) deploy ;;
     backup) shift; backup_vm "$@" ;;
     prepare)
+        validate_config
         install_dependencies
         download_image
         prepare_image

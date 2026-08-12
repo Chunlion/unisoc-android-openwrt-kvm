@@ -70,8 +70,9 @@ if [ "$current_mode" != "$ipv6_passthrough" ]; then
 	/etc/init.d/firewall restart
 	/etc/init.d/odhcpd restart
 	# Remove the no-longer-advertised ULA from the router itself as well.
-	[ "$ipv6_passthrough" = 1 ] && \
+	if [ "$ipv6_passthrough" = 1 ]; then
 		ip -6 addr del fd00:beef:88::1/64 dev br-lan 2>/dev/null || true
+	fi
 elif [ "$bridge_mac_changed" = 1 ]; then
 	/etc/init.d/network reload
 	/etc/init.d/odhcpd restart

@@ -52,8 +52,18 @@ die() {
     exit 1
 }
 
+process_matches() {
+    process_pid="$1"
+    process_pattern="$2"
+    case "$process_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$process_pid/cmdline" ] || return 1
+    tr '\000' ' ' < "/proc/$process_pid/cmdline" 2>/dev/null | \
+        grep -Fq "$process_pattern"
+}
+
 load_config() {
     [ -r "$CONFIG" ] || die "missing $CONFIG; run deploy-openwrt.sh first"
+    # shellcheck source=/dev/null
     . "$CONFIG"
     : "${ROOT_DEVICE:=/dev/vda}"
     : "${VM_CPUS:=6}"
@@ -83,8 +93,7 @@ release_lock() {
 acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
-        if [ -n "$lock_pid" ] && [ -r "/proc/$lock_pid/cmdline" ] && \
-                tr '\000' ' ' < "/proc/$lock_pid/cmdline" | grep -Fq "$0"; then
+        if process_matches "$lock_pid" "$0"; then
             die "another OpenWrt control command is running (PID $lock_pid)"
         fi
         rm -f "$LOCK_DIR/pid"
@@ -165,6 +174,7 @@ matches_tether_pattern() {
     iface="$1"
     [ "$TETHER_IFACE_PATTERNS" = auto ] && return 0
     for pattern in $TETHER_IFACE_PATTERNS; do
+        # shellcheck disable=SC2254 # Patterns are configured shell globs.
         case "$iface" in $pattern) return 0 ;; esac
     done
     return 1
@@ -173,7 +183,7 @@ matches_tether_pattern() {
 is_tether_candidate() {
     iface="$1"
     case "$iface" in
-        lo|dummy*|tun*|ip6tnl*|sit*|gre*|gretap*|erspan*|vowifi*|owrt-*|owx-*) return 1 ;;
+        lo|dummy*|tun*|ip6tnl*|sit*|gre*|erspan*|vowifi*|owrt-*|owx-*) return 1 ;;
     esac
     [ "$iface" = "$CELLULAR_IFACE" ] && return 1
     matches_tether_pattern "$iface" && is_tethered "$iface"
@@ -198,9 +208,7 @@ is_tether_capable() {
 is_running() {
     [ -r "$PIDFILE" ] || return 1
     pid="$(cat "$PIDFILE" 2>/dev/null)"
-    [ -n "$pid" ] || return 1
-    [ -d "/proc/$pid" ] || return 1
-    tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "$CROSVM"
+    process_matches "$pid" "$CROSVM" && process_matches "$pid" "$DISK"
 }
 
 ensure_jump() {
@@ -249,25 +257,41 @@ refresh_tether_state() {
 }
 
 is_tethered() {
-    grep -q "^[[:space:]]*$1 - TetheredState[[:space:]]*$" "$TETHER_STATE_FILE" 2>/dev/null
+    awk -v iface="$1" \
+        '$1 == iface && $2 == "-" && $3 == "TetheredState" && NF == 3 { found = 1 }
+         END { exit !found }' "$TETHER_STATE_FILE" 2>/dev/null
+}
+
+connector_tag() {
+    printf '%s' "$1" | tr -cd 'A-Za-z0-9' | awk '
+        length($0) <= 10 { print; next }
+        { print substr($0, 1, 6) substr($0, length($0) - 3) }
+    '
 }
 
 bridge_attach() {
     iface="$1"
     [ -e "/sys/class/net/$iface" ] || return 0
     if [ -d "/sys/class/net/$iface/bridge" ]; then
-        tag="$(printf '%s' "$iface" | tr -cd 'A-Za-z0-9' | cut -c1-7)"
+        tag="$(connector_tag "$iface")"
+        legacy_tag="$(printf '%s' "$iface" | tr -cd 'A-Za-z0-9' | cut -c1-7)"
         connector_host="owx-${tag}h"
         connector_peer="owx-${tag}p"
         if [ ! -e "/sys/class/net/$connector_host" ]; then
-            ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' > "$VM_DIR/bridge-$iface.addr"
+            [ "$legacy_tag" = "$tag" ] || \
+                ip link delete "owx-${legacy_tag}h" 2>/dev/null || true
+            [ -e "$VM_DIR/bridge-$iface.connector" ] || \
+                ip -4 -o addr show dev "$iface" 2>/dev/null | \
+                    awk '{print $4}' > "$VM_DIR/bridge-$iface.addr"
             ip link add "$connector_host" type veth peer name "$connector_peer"
-            ip link set dev "$connector_host" master "$LAN_BRIDGE"
-            ip link set dev "$connector_peer" master "$iface"
-            ip link set dev "$connector_host" up
-            ip link set dev "$connector_peer" up
-            touch "$VM_DIR/bridge-$iface.connector"
         fi
+        # Android may delete and recreate its aggregate bridge while tethering
+        # remains enabled. Reapply both masters even when the veth pair survived.
+        ip link set dev "$connector_host" master "$LAN_BRIDGE"
+        ip link set dev "$connector_peer" master "$iface"
+        ip link set dev "$connector_host" up
+        ip link set dev "$connector_peer" up
+        touch "$VM_DIR/bridge-$iface.connector"
         ip -4 addr flush dev "$iface" 2>/dev/null || true
         ip link set dev "$iface" up
         return 0
@@ -286,24 +310,31 @@ bridge_attach() {
 
 bridge_detach() {
     iface="$1"
-    [ -e "/sys/class/net/$iface" ] || return 0
     if [ -e "$VM_DIR/bridge-$iface.connector" ]; then
-        tag="$(printf '%s' "$iface" | tr -cd 'A-Za-z0-9' | cut -c1-7)"
+        tag="$(connector_tag "$iface")"
+        legacy_tag="$(printf '%s' "$iface" | tr -cd 'A-Za-z0-9' | cut -c1-7)"
         ip link delete "owx-${tag}h" 2>/dev/null || true
-        if [ -s "$VM_DIR/bridge-$iface.addr" ]; then
+        [ "$legacy_tag" = "$tag" ] || \
+            ip link delete "owx-${legacy_tag}h" 2>/dev/null || true
+        if [ -e "/sys/class/net/$iface" ] && [ -s "$VM_DIR/bridge-$iface.addr" ]; then
             while read -r saved_addr; do
-                [ -n "$saved_addr" ] && ip -4 addr add "$saved_addr" dev "$iface" 2>/dev/null || true
+                if [ -n "$saved_addr" ]; then
+                    ip -4 addr add "$saved_addr" dev "$iface" 2>/dev/null || true
+                fi
             done < "$VM_DIR/bridge-$iface.addr"
         fi
         rm -f "$VM_DIR/bridge-$iface.addr" "$VM_DIR/bridge-$iface.connector"
         return 0
     fi
+    [ -e "/sys/class/net/$iface" ] || return 0
     current_master="$(basename "$(readlink "/sys/class/net/$iface/master" 2>/dev/null)" 2>/dev/null)"
     [ "$current_master" = "$LAN_BRIDGE" ] || return 0
     ip link set dev "$iface" nomaster
     if [ -s "$VM_DIR/bridge-$iface.addr" ]; then
         while read -r saved_addr; do
-            [ -n "$saved_addr" ] && ip -4 addr add "$saved_addr" dev "$iface" 2>/dev/null || true
+            if [ -n "$saved_addr" ]; then
+                ip -4 addr add "$saved_addr" dev "$iface" 2>/dev/null || true
+            fi
         done < "$VM_DIR/bridge-$iface.addr"
     fi
     rm -f "$VM_DIR/bridge-$iface.addr"
@@ -318,6 +349,12 @@ sync_bridge_ports_cached() {
                 [ -e "$VM_DIR/bridge-$iface.connector" ]; then
             bridge_detach "$iface"
         fi
+    done
+    for state_file in "$VM_DIR"/bridge-*.connector; do
+        [ -e "$state_file" ] || continue
+        iface="${state_file##*/bridge-}"
+        iface="${iface%.connector}"
+        [ -e "/sys/class/net/$iface" ] || bridge_detach "$iface"
     done
 }
 
@@ -341,8 +378,7 @@ stop_ra6_port() {
     pidfile="$VM_DIR/ra6-$iface.pid"
     if [ -r "$pidfile" ]; then
         ra_pid="$(cat "$pidfile" 2>/dev/null)"
-        if [ -n "$ra_pid" ] && [ -r "/proc/$ra_pid/cmdline" ] && \
-                tr '\000' ' ' < "/proc/$ra_pid/cmdline" | grep -q "$RA6"; then
+        if process_matches "$ra_pid" "$RA6 $iface "; then
             kill "$ra_pid" 2>/dev/null || true
             # ra6 sends withdrawal advertisements on SIGTERM. Wait for those
             # frames before a replacement announces a new prefix, otherwise
@@ -367,8 +403,10 @@ stop_ipv6_downstream() {
     while ip -6 rule del priority "$IPV6_OUT_RULE_PRIO" 2>/dev/null; do :; done
     while ip -6 rule del priority "$IPV6_IN_RULE_PRIO" 2>/dev/null; do :; done
     old_prefix="$(cat "$IPV6_PREFIX_FILE" 2>/dev/null)"
-    [ -n "$old_prefix" ] && ip -6 route del "$old_prefix/64" dev "$LAN_BRIDGE" table main 2>/dev/null || true
-    [ -n "$old_prefix" ] && ip -6 route del "$old_prefix/64" dev "$WAN_TAP" table main 2>/dev/null || true
+    if [ -n "$old_prefix" ]; then
+        ip -6 route del "$old_prefix/64" dev "$LAN_BRIDGE" table main 2>/dev/null || true
+        ip -6 route del "$old_prefix/64" dev "$WAN_TAP" table main 2>/dev/null || true
+    fi
     ip -6 addr del fe80::1/64 dev "$LAN_BRIDGE" 2>/dev/null || true
     ip -6 addr del fe80::1/64 dev "$WAN_TAP" 2>/dev/null || true
     delete_ip6_jump_and_chain FORWARD "$IPV6_FORWARD_CHAIN"
@@ -383,7 +421,7 @@ ensure_ra6_port() {
     pidfile="$VM_DIR/ra6-$iface.pid"
     if [ -r "$pidfile" ]; then
         ra_pid="$(cat "$pidfile" 2>/dev/null)"
-        [ -n "$ra_pid" ] && [ -d "/proc/$ra_pid" ] && return 0
+        process_matches "$ra_pid" "$RA6 $iface " && return 0
     fi
     stop_ra6_port "$iface"
     # Advertise the bridge itself as the preferred router. Android may also
@@ -537,6 +575,12 @@ refresh_ipv6() {
 detach_bridge_ports() {
     for path in /sys/class/net/*; do
         iface="${path##*/}"
+        bridge_detach "$iface"
+    done
+    for state_file in "$VM_DIR"/bridge-*.connector; do
+        [ -e "$state_file" ] || continue
+        iface="${state_file##*/bridge-}"
+        iface="${iface%.connector}"
         bridge_detach "$iface"
     done
 }
@@ -779,7 +823,7 @@ network_monitor() {
 start_monitor() {
     if [ -r "$MONITOR_PIDFILE" ]; then
         monitor_pid="$(cat "$MONITOR_PIDFILE" 2>/dev/null)"
-        [ -n "$monitor_pid" ] && [ -d "/proc/$monitor_pid" ] && return 0
+        process_matches "$monitor_pid" "$0 __network_monitor" && return 0
     fi
     nohup "$0" __network_monitor </dev/null >/dev/null 2>&1 &
     echo "$!" > "$MONITOR_PIDFILE"
@@ -788,7 +832,9 @@ start_monitor() {
 stop_monitor() {
     if [ -r "$MONITOR_PIDFILE" ]; then
         monitor_pid="$(cat "$MONITOR_PIDFILE" 2>/dev/null)"
-        [ -n "$monitor_pid" ] && kill "$monitor_pid" 2>/dev/null || true
+        if process_matches "$monitor_pid" "$0 __network_monitor"; then
+            kill "$monitor_pid" 2>/dev/null || true
+        fi
     fi
     rm -f "$MONITOR_PIDFILE"
 }
@@ -970,7 +1016,16 @@ status_vm() {
     load_config
     resolve_device_config
     if is_running; then
-        bridge_ports="$(ls "/sys/class/net/$LAN_BRIDGE/brif" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+        bridge_ports=""
+        for port_path in "/sys/class/net/$LAN_BRIDGE/brif"/*; do
+            [ -e "$port_path" ] || continue
+            port="${port_path##*/}"
+            if [ -n "$bridge_ports" ]; then
+                bridge_ports="$bridge_ports,$port"
+            else
+                bridge_ports="$port"
+            fi
+        done
         ufi_state=stopped
         port_listening "$UFI_TOOLS_PORT" && ufi_state=running
         echo "running PID=$(cat "$PIDFILE") wan=$WAN_GUEST_IP lan=$LAN_GUEST_IP bridge=$LAN_BRIDGE ports=${bridge_ports:-none} ipv6_passthrough=$IPV6_PASSTHROUGH ssh=host:$SSH_DNAT_PORT ufi=$ufi_state:$UFI_TOOLS_PORT"
